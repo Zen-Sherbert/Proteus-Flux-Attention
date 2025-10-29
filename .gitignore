@@ -1,0 +1,36 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
+*.egg-info/
+.eggs/
+.build/
+build/
+dist/
+pip-wheel-metadata/
+.pytest_cache/
+.ipynb_checkpoints/
+.mypy_cache/
+.coverage*
+htmlcov/
+.env
+.venv/
+venv/
+ENV/
+env/
+
+# ---- Editors / OS ----
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# ---- Project artifacts (tweak for your repo) ----
+reports/
+checkpoints/
+data/
+*.pt
+*.bin
+*.ckpt

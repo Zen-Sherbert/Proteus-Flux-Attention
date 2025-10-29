@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "protean-forge"
+version = "0.1.0"
+description = "Genetic Attention modules powered by the Dynamic Mixture-of-Attention-Heads (DMoAH) architecture."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Protean Forge Contributors" }]
+keywords = ["attention", "sparse-attention", "flux", "triton", "deep-learning"]
+dependencies = [
+    "torch>=2.1",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Intended Audience :: Science/Research",
+    "License :: Other/Proprietary License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+gpu = ["triton>=2.1"]
+dev = ["pytest>=7"]
+examples = ["matplotlib>=3.7"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
