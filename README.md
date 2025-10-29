@@ -1,14 +1,14 @@
-# Proteus-Flux-Attention
+# Proteus-Attention
 
 **A Novel Attention Architecture for Extreme Long-Context Modeling on Commodity Hardware.**
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![PyPI version](https://badge.fury.io/py/proteus-flux-attention.svg)](https://badge.fury.io/py/proteus-flux-attention)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/your-username/proteus-flux-attention/ci.yml?branch=main)](https://github.com/your-username/proteus-flux-attention/actions)
+[![PyPI version](https://badge.fury.io/py/proteus-attention.svg)](https://badge.fury.io/py/proteus-attention)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/your-username/proteus-attention/ci.yml?branch=main)](https://github.com/your-username/proteus-attention/actions)
 
 ---
 
-Proteus-Flux-Attention is a new computational paradigm for Transformer models, designed to systematically solve the quadratic complexity bottleneck of standard attention. It is a full-stack, architecturally complete system that integrates high-level intelligent routing logic with a novel, adaptive low-level execution kernel.
+Proteus Attention is a new computational paradigm for Transformer models, designed to systematically solve the quadratic complexity bottleneck of standard attention. It is a full-stack, architecturally complete system that integrates high-level intelligent routing logic with a novel, adaptive low-level execution kernel.
 
 Our empirical validation demonstrates the ability to process context windows exceeding **500,000 tokens on a single 16GB GPU**—a capability that redefines the accessibility of massive-scale AI. This is not merely a sparse approximation, but a principled redesign of the attention mechanism to be both computationally efficient and structurally intelligent.
 
@@ -24,27 +24,27 @@ The architecture is built on a series of synergistic, novel concepts:
 
 ## Empirical Validation
 
-Proteus-Flux demonstrates a clear shift in asymptotic performance compared to standard scaled-dot-product attention. The following results were obtained on a single 16GB AMD Radeon RX 7800 XT.
+Proteus demonstrates a clear shift in asymptotic performance compared to standard scaled-dot-product attention. The following results were obtained on a single 16GB AMD Radeon RX 7800 XT.
 
 | Sequence Length | Model                     | Latency (ms) | Peak VRAM (MB) |
 | :-------------- | :------------------------ | :----------- | :------------- |
 | 512             | Standard Attention        | 0.42         | 122            |
-| 512             | Proteus-Flux (FP32)       | 3.53         | 69             |
+| 512             | Proteus (FP32)       | 3.53         | 69             |
 | ---             | ---                       | ---          | ---            |
 | 4,096           | Standard Attention        | 11.93        | 1,122          |
-| 4,096           | Proteus-Flux (FP32)       | 8.72         | 334            |
+| 4,096           | Proteus (FP32)       | 8.72         | 334            |
 | ---             | ---                       | ---          | ---            |
 | 32,768          | Standard Attention        | OOM          | >16,000        |
-| 32,768          | Proteus-Flux (FP32)       | 26.20        | 471            |
+| 32,768          | Proteus (FP32)       | 26.20        | 471            |
 | ---             | ---                       | ---          | ---            |
 | 524,288         | Standard Attention        | OOM          | -              |
-| 524,288         | Proteus-Flux (FP32)       | 187.58       | 7,010          |
+| 524,288         | Proteus (FP32)       | 187.58       | 7,010          |
 
 ## Installation
 
 The package can be installed via pip:
 ```bash
-pip install proteus-flux-attention
+pip install proteus-attention
 ```
 
 ## Usage: Drop-in API
@@ -63,9 +63,9 @@ self.attn = nn.MultiheadAttention(
 )
 ```
 
-**Proteus-Flux Implementation:**
+**Proteus Implementation:**
 ```python
-from proteus_flux_attention import CausalGeneticMultiheadAttention
+from proteus_attention import CausalGeneticMultiheadAttention
 
 # A one-line, drop-in replacement
 self.attn = CausalGeneticMultiheadAttention(
@@ -108,7 +108,7 @@ To replicate the benchmark results or train a model using this architecture, ple
 
 ## Future Work
 
-Proteus-Flux is an active research project. Key areas for future investigation include:
+Proteus is an active research project. Key areas for future investigation include:
 
 *   **Kernel Fusion:** Fusing the candidate-generation logic into a dedicated CUDA/Triton kernel to further reduce computational overhead at extreme scales.
 *   **Autonomous Control:** Developing the integrated `SparseHeadController` into a fully autonomous agent that can learn optimal sparsity policies via reinforcement learning.
@@ -117,13 +117,13 @@ Proteus-Flux is an active research project. Key areas for future investigation i
 
 ## Citation
 
-If you use Proteus-Flux-Attention in your work, please cite the repository:
+If you use Proteus-Attention in your work, please cite the repository:
 
 ```bibtex
-@software{proteus_flux_2025,
+@software{proteus_2025,
   author = {Scott Dietz},
-  title = {{Proteus-Flux-Attention: A Novel Attention Architecture for Extreme Long-Context Modeling}},
-  url = {https://github.com/Zen-Sherbert/Proteus-Flux-Attention},
+  title = {{Proteus-Attention: A Novel Attention Architecture for Extreme Long-Context Modeling}},
+  url = {https://github.com/Zen-Sherbert/Proteus-Attention},
   year = {2025}
 }
 ```
