@@ -1,119 +1,123 @@
 # Proteus-Attention
 
-**A Novel Attention Architecture for Extreme Long-Context Modeling on Commodity Hardware.**
+**An Adaptive Attention Architecture for Extreme Long-Context Modeling.**
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![PyPI version](https://badge.fury.io/py/proteus-attention.svg)](https://badge.fury.io/py/proteus-attention)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/your-username/proteus-attention/ci.yml?branch=main)](https://github.com/your-username/proteus-attention/actions)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/Zen-Sherbert/Proteus-Attention/ci.yml?branch=main)](https://github.com/Zen-Sherbert/Proteus-Attention/actions)
 
 ---
 
-Proteus Attention is a new computational paradigm for Transformer models, designed to systematically solve the quadratic complexity bottleneck of standard attention. It is a full-stack, architecturally complete system that integrates high-level intelligent routing logic with a novel, adaptive low-level execution kernel.
+Standard Transformers can't read a whole book. Their attention mechanism fails under long sequences, hitting a quadratic wall of computation and memory. Proteus-Attention is a full-stack redesign that solves this problem.
 
-Our empirical validation demonstrates the ability to process context windows exceeding **500,000 tokens on a single 16GB GPU**—a capability that redefines the accessibility of massive-scale AI. This is not merely a sparse approximation, but a principled redesign of the attention mechanism to be both computationally efficient and structurally intelligent.
+It enables models to process context windows exceeding **500,000 tokens on a single consumer-grade GPU**, turning what was once a supercomputing challenge into a task for commodity hardware.
+
+<br>
+
+> ## Key Features
+>
+> -   **Extreme Scalability:** Processes 500k+ tokens on a single 16GB GPU, avoiding the OOM errors of standard attention.
+> -   **The Protean Slider:** A revolutionary control system that fluidly adapts the attention mechanism—from dense quadratic to sparse sub-quadratic to linear-time—ensuring optimal performance at any sequence length.
+> -   **Hardware-Optimized:** Includes a custom, JIT-compiled Triton kernel to achieve maximum performance on NVIDIA GPUs, with a highly efficient PyTorch fallback for other platforms.
+> -   **Intelligent Routing:** Uses a novel **DNA (Dynamic Network Affinity)** system to create a semantic, long-term memory, enabling smarter, content-aware routing decisions.
+> -   **Drop-in Ready:** Designed as a one-line replacement for standard attention layers in existing Transformer architectures.
+
+<br>
+
+## The Core Innovation: The Protean Slider
+
+At the heart of Proteus is the **Protean Slider**, a system that acts like an automatic transmission for attention. It understands that no single algorithm is optimal for all situations and seamlessly shifts "gears" on-the-fly.
+
+This is controlled by a dynamic `alpha` value that continuously morphs the attention mechanism:
+
+```
+Sequence Length:  Short ───────> Medium ────────> Extreme
+Alpha Value:      0.0   ────────> 0.5    ────────> 1.0
+Attention Mode:   Dense         Sparse           Linear (Fixed-Cost)
+                  (Quadratic)   (Sub-Quadratic)  (Information Retrieval)
+```
+
+This automated, smooth transition eliminates performance cliffs and training instabilities, allowing a single model to be an expert at both short-sentence syntax and book-length semantic retrieval.
 
 ## Architectural Pillars
 
-The architecture is built on a series of synergistic, novel concepts:
+The architecture is built on five interlocking concepts powered by the Protean Slider:
 
-1.  **The Protean Kernel:** A custom Triton kernel that functions as a single, unified engine for attention. It operates on a continuous performance curve, fluidly interpolating its computational graph from a sub-quadratic to a linear-time regime on-the-fly, ensuring optimal performance at every sequence length.
-2.  **Double Sparsity:** A multi-axis approach that prunes both heads (functional specialization) and tokens (salience), enabling the model to learn a dynamic computational budget allocation.
-3.  **DNA (Dynamic Network Alleles):** A persistent, semantic memory composed of learned "prototype" vectors. DNA provides a powerful, content-aware routing prior, allowing the model to make instantaneous, conceptually-grounded routing decisions.
-4.  **Decoupled Gating:** An architectural abstraction where a large set of fine-grained "gates" (skills) are mapped to a smaller set of physical attention heads. This promotes a hierarchical division of labor, allowing for the natural emergence of both generalist and hyper-specialist heads.
-5.  **Hybrid Routing:** A sophisticated decision-making system that blends the long-term semantic memory of DNA with a context-aware learned router, creating a robust mechanism that leverages the strengths of both content-based and pattern-based information processing.
+1.  **Unified Kernel:** A single, custom Triton kernel serves as the engine for all operational modes. It is a templated, adaptive kernel that JIT-compiles itself based on the `alpha` value, ensuring maximum performance at every point on the curve.
+2.  **Double Sparsity:** A multi-axis approach that prunes both heads (functional specialization) and tokens (salience), enabling the model to learn a dynamic computational budget.
+3.  **DNA (Dynamic Network Affinity):** A persistent, semantic memory composed of learned "prototype" vectors. DNA provides a powerful, content-aware routing prior, helping the model establish critical long-range dependencies.
+4.  **Gates vs. Heads: A Smarter Division of Labor:** We decouple the router's decision space ("gates") from the execution units ("heads"). This abstraction encourages a rich hierarchy where some heads become generalists and others become hyper-specialists.
+5.  **Hybrid Routing:** A sophisticated decision system that blends the long-term semantic memory of DNA with a context-aware learned router, creating a robust mechanism that leverages both content-based and pattern-based information processing.
 
 ## Empirical Validation
 
-Proteus demonstrates a clear shift in asymptotic performance compared to standard scaled-dot-product attention. The following results were obtained on a single 16GB AMD Radeon RX 7800 XT.
+The result: Proteus avoids the 'Out of Memory' errors that plague standard attention and maintains high performance at scales that were previously impossible on consumer hardware.
+
+> **Hardware Note:** The following results were obtained on a single **16GB AMD Radeon RX 7800 XT** using the efficient PyTorch-native fallback path. Performance is expected to be significantly higher on NVIDIA GPUs leveraging the integrated Triton kernel (see our Vision & Roadmap).
 
 | Sequence Length | Model                     | Latency (ms) | Peak VRAM (MB) |
 | :-------------- | :------------------------ | :----------- | :------------- |
 | 512             | Standard Attention        | 0.42         | 122            |
-| 512             | Proteus (FP32)       | 3.53         | 69             |
+| 512             | Proteus (FP32)            | 3.53         | 69             |
 | ---             | ---                       | ---          | ---            |
-| 4,096           | Standard Attention        | 11.93        | 1,122          |
-| 4,096           | Proteus (FP32)       | 8.72         | 334            |
+| 32,768          | Standard Attention        | **OOM**      | >16,000        |
+| 32,768          | Proteus (FP32)            | 26.20        | 471            |
 | ---             | ---                       | ---          | ---            |
-| 32,768          | Standard Attention        | OOM          | >16,000        |
-| 32,768          | Proteus (FP32)       | 26.20        | 471            |
-| ---             | ---                       | ---          | ---            |
-| 524,288         | Standard Attention        | OOM          | -              |
-| 524,288         | Proteus (FP32)       | 187.58       | 7,010          |
+| 524,288         | Standard Attention        | **OOM**      | -              |
+| 524,288         | Proteus (FP32)            | 187.58       | 7,010          |
 
 ## Installation
 
-The package can be installed via pip:
 ```bash
 pip install proteus-attention
 ```
 
-## Usage: Drop-in API
+## Usage: A Complete Example
 
-The system is designed for ease of integration via the `CausalGeneticMultiheadAttention` module, which mirrors the standard `torch.nn.MultiheadAttention` API.
+Proteus is designed for effortless integration. All complexity is handled internally by the `ModelConfig`.
 
-**Standard Implementation:**
 ```python
 import torch.nn as nn
+from proteus_attention import CausalDynamicAttention as ProteusAttention
+from proteus_attention import ModelConfig
 
-# Standard Transformer Block
-self.attn = nn.MultiheadAttention(
-    embed_dim=d_model, 
-    num_heads=n_head, 
-    batch_first=True
+# 1. Define your model's configuration
+# The 'auto' mode will manage the Protean Slider for you.
+config = ModelConfig(
+    d_model=1024,
+    n_head=16,
+    attn_mode="auto",
+    attn_linear_switch_ctx=16384 # The sequence length to fully transition to linear mode
 )
+
+# 2. Drop it into your Transformer block
+# This is a one-line replacement for nn.MultiheadAttention or other custom layers.
+self.attn = ProteusAttention(config)
+
+# ... then use it like any other attention layer
+output = self.attn(x)
 ```
 
-**Proteus Implementation:**
-```python
-from proteus_attention import CausalGeneticMultiheadAttention
+## Training an Adaptive Model
 
-# A one-line, drop-in replacement
-self.attn = CausalGeneticMultiheadAttention(
-    embed_dim=d_model, 
-    num_heads=n_head, 
-    batch_first=True
-)
-```
+The Protean Slider enables powerful and flexible training strategies.
 
-## Architectural Deep Dive
+#### Method 1: Sliding Context Curriculum (Recommended)
+Train the model on a mix of sequence lengths to exercise the full range of the `alpha` slider. A good starting ratio is:
+*   **70% Short Context Batches (<2k tokens):** Hones dense and sparse capabilities.
+*   **20% Medium Context Batches (2k-16k tokens):** Ensures a stable transition.
+*   **10% Long Context Batches (16k+ tokens):** Develops long-range retrieval.
 
-<details>
-<summary><b>1. The Protean Kernel and its Gradient Control System</b></summary>
-<p>
-The core execution engine is a custom Triton kernel. Its behavior is controlled by a high-level `alpha` parameter, which continuously interpolates the underlying attention pattern from a dense, local configuration (ideal for short, syntactically rich contexts) to a sparse, fixed-size candidate set (ideal for long-range, semantic retrieval). This smooth transition between computational regimes is critical for maintaining stable training gradients across a curriculum of varying sequence lengths, avoiding the performance cliffs and instabilities of discrete mode switching.
-</p>
-</details>
+#### Method 2: Loss-Gated Context Expansion (Advanced)
+Create a universal model by linking the `alpha` slider to your validation loss. Start training at `alpha = 0.0`. When the loss plateaus, "up-shift" the `alpha` value and continue training. This allows the model to master one level of contextual complexity before moving to the next.
 
-<details>
-<summary><b>2. DNA as an Interpretable, Explicit Memory</b></summary>
-<p>
-The DNA prototypes are a set of learned vectors that are persistent across training and inference. They evolve via an Exponential Moving Average of the token embeddings routed to their corresponding gates, forming a compressed representation of the core semantic concepts the model has learned. This mechanism not only provides a powerful routing prior but also functions as an explicit, interpretable memory. By analyzing the DNA tensor and its relationship to known concept embeddings, it is possible to inspect and understand the model's internal "world model."
-</p>
-</details>
+## Vision & Roadmap
 
-<details>
-<summary><b>3. Emergent Specialization via Decoupled Gating</b></summary>
-<p>
-By decoupling the router's decision space ("gates") from the execution units ("heads"), the architecture allows for a more flexible and robust division of labor. This many-to-one mapping naturally encourages the formation of a head hierarchy. Some heads become generalists, serving as the target for many related gates, while others become hyper-specialists, activated by a single, specific gate. This mitigates the problem of "expert collapse" seen in other MoE systems and leads to a more efficient and capable final model.
-</p>
-</details>
-
-
-## Replication & Training
-
-To replicate the benchmark results or train a model using this architecture, please refer to the provided scripts:
-
-*   **Performance Benchmark:** The `tinytoy.py` script provides the harness for performance and memory validation.
-*   **Training Curriculum:** The `train_sliding_ctx.py` script provides a working example of a sliding-context curriculum, a training strategy designed to optimally leverage the adaptive nature of the Protean architecture.
-
-## Future Work
-
-Proteus is an active research project. Key areas for future investigation include:
-
-*   **Kernel Fusion:** Fusing the candidate-generation logic into a dedicated CUDA/Triton kernel to further reduce computational overhead at extreme scales.
-*   **Autonomous Control:** Developing the integrated `SparseHeadController` into a fully autonomous agent that can learn optimal sparsity policies via reinforcement learning.
-*   **Analysis of Emergent Structures:** Investigating the conceptual clusters within the trained DNA space and the graph topology of the `gate_to_head` mapping to better understand the emergent knowledge structures within the model.
-*   **Knowledge Transfer:** Exploring methods for transferring trained DNA and gate mappings between models to accelerate fine-tuning and enable novel forms of model composition.
+Proteus is an active research project. Our immediate goals are:
+*   **Achieve True Hardware Agnosticism:** Provide comprehensive benchmarks on NVIDIA hardware (e.g., A100, 4090) to validate the Triton kernel and publish official performance targets.
+*   **Evaluate Model Quality:** Move beyond systems metrics to include perplexity scores on long-context language tasks (e.g., Project Gutenberg) to rigorously evaluate quality.
+*   **Perfect the "Drop-in Ready" Experience:** Provide a rich set of pre-configured `ModelConfig` settings for common use-cases (e.g., "Max Quality," "Max Context Length," "Fastest Inference").
+*   **Expand to New Modalities:** Apply the Proteus architecture to non-text data, such as high-resolution images, long-form audio, and genomic sequences.
 
 ## Citation
 
@@ -122,7 +126,7 @@ If you use Proteus-Attention in your work, please cite the repository:
 ```bibtex
 @software{proteus_2025,
   author = {Scott Dietz},
-  title = {{Proteus-Attention: A Novel Attention Architecture for Extreme Long-Context Modeling}},
+  title = {{Proteus-Attention: An Adaptive Attention Architecture for Extreme Long-Context Modeling}},
   url = {https://github.com/Zen-Sherbert/Proteus-Attention},
   year = {2025}
 }
