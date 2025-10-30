@@ -1,4 +1,6 @@
 # benchmark.py
+from proteus_attention.models.dmoah import CausalDynamicAttention
+from proteus_attention.kernels.sparse_attn import get_last_backend_info
 import argparse
 import json
 import os
@@ -17,8 +19,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # --- Import your custom modules ---
-from protean_forge.kernels.sparse_attn import get_last_backend_info
-from protean_forge.models.dmoah import CausalDynamicAttention
 
 # Ensure CUDA allocator uses expandable segments to reduce fragmentation.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -27,12 +27,14 @@ if torch.cuda.is_available():
 
 # --- Helper Functions ---
 
+
 def get_device():
     """Gets the best available device."""
     if torch.cuda.is_available():
         return torch.device("cuda")
     # Add other devices here if needed, e.g., 'mps' for Apple Silicon
     return torch.device("cpu")
+
 
 @torch.inference_mode()
 def benchmark_forward_pass(model, x, num_runs=50):
@@ -52,15 +54,19 @@ def benchmark_forward_pass(model, x, num_runs=50):
         warmup_runs = 1
     else:
         warmup_runs = 10
-    
+
     # Warmup runs
     for _ in range(warmup_runs):
         _ = model(x)
-    
+
     if device.type == 'cuda':
         torch.cuda.synchronize()
-        
-    if seq_len >= 65536:
+
+    if seq_len >= 524288:
+        eval_runs = 1
+    elif seq_len >= 131072:
+        eval_runs = min(num_runs, 2)
+    elif seq_len >= 65536:
         eval_runs = min(num_runs, 2)
     elif seq_len >= 32768:
         eval_runs = min(num_runs, 3)
@@ -74,14 +80,15 @@ def benchmark_forward_pass(model, x, num_runs=50):
     start_time = time.perf_counter()
     for _ in range(eval_runs):
         _ = model(x)
-    
+
     if device.type == 'cuda':
         torch.cuda.synchronize()
-        
+
     end_time = time.perf_counter()
-    
+
     avg_latency_ms = ((end_time - start_time) / eval_runs) * 1000
     return avg_latency_ms
+
 
 @torch.inference_mode()
 def get_peak_memory_mb(model, x):
@@ -89,10 +96,10 @@ def get_peak_memory_mb(model, x):
     device = get_device()
     if device.type != 'cuda':
         return 0.0
-        
+
     model.to(device)
     x = x.to(device)
-    
+
     torch.cuda.reset_peak_memory_stats(device)
     _ = model(x)
     if device.type == 'cuda':
@@ -127,7 +134,8 @@ def build_sequence_lengths(
         if not seq_lengths:
             seq_lengths = [min(base_lengths)]
     else:
-        seq_lengths = [length for length in base_lengths if max_seq_len is None or length <= max_seq_len]
+        seq_lengths = [
+            length for length in base_lengths if max_seq_len is None or length <= max_seq_len]
         if not seq_lengths:
             seq_lengths = [min(base_lengths)]
     return seq_lengths
@@ -220,7 +228,13 @@ def _apply_memory_saving_overrides(config: SimpleNamespace, seq_len: int) -> Sim
     """
     base_keep = getattr(config, "attn_token_keep_ratio", 1.0)
     target_keep_ratio = base_keep
-    if seq_len >= 32768:
+    if seq_len >= 1_048_576:
+        target_keep_ratio = min(target_keep_ratio, 0.0015)
+    elif seq_len >= 524_288:
+        target_keep_ratio = min(target_keep_ratio, 0.0025)
+    elif seq_len >= 131072:
+        target_keep_ratio = min(target_keep_ratio, 0.005)
+    elif seq_len >= 32768:
         target_keep_ratio = min(target_keep_ratio, 0.01)
     elif seq_len >= 16384:
         target_keep_ratio = min(target_keep_ratio, 0.04)
@@ -232,8 +246,10 @@ def _apply_memory_saving_overrides(config: SimpleNamespace, seq_len: int) -> Sim
         target_keep_ratio = min(target_keep_ratio, 0.20)
     elif seq_len >= 1024:
         target_keep_ratio = min(target_keep_ratio, 0.30)
-    config.attn_token_keep_ratio = min(getattr(config, "attn_token_keep_ratio", 1.0), target_keep_ratio)
-    min_keep_cfg = min(seq_len, 12 if seq_len >= 32768 else 24 if seq_len >= 8192 else 64)
+    config.attn_token_keep_ratio = min(
+        getattr(config, "attn_token_keep_ratio", 1.0), target_keep_ratio)
+    min_keep_cfg = min(seq_len, 12 if seq_len >=
+                       32768 else 24 if seq_len >= 8192 else 64)
     guard_val = max(int(getattr(config, "attn_token_keep_guard", 1) or 1), 1)
     if seq_len >= 32768:
         guard_val = min(guard_val, 64)
@@ -264,7 +280,9 @@ def _apply_memory_saving_overrides(config: SimpleNamespace, seq_len: int) -> Sim
         config.attn_h_active_max = 4
     config.attn_h_active = active_heads
     linear_cap = 1024
-    if seq_len >= 32768:
+    if seq_len >= 1_048_576:
+        linear_cap = 24
+    elif seq_len >= 32768:
         linear_cap = 48
     elif seq_len >= 16384:
         linear_cap = 80
@@ -272,22 +290,32 @@ def _apply_memory_saving_overrides(config: SimpleNamespace, seq_len: int) -> Sim
         linear_cap = 160
     elif seq_len >= 4096:
         linear_cap = 256
-    config.attn_linear_L_max = min(getattr(config, "attn_linear_L_max", 2048), linear_cap)
-    config.attn_linear_L_base = min(getattr(config, "attn_linear_L_base", config.attn_linear_L_max), config.attn_linear_L_max)
+    config.attn_linear_L_max = min(
+        getattr(config, "attn_linear_L_max", 2048), linear_cap)
+    config.attn_linear_L_base = min(getattr(
+        config, "attn_linear_L_base", config.attn_linear_L_max), config.attn_linear_L_max)
     min_cap = 64 if seq_len >= 16384 else 128
     min_cap = min(min_cap, linear_cap)
-    config.attn_linear_L_min = min(getattr(config, "attn_linear_L_min", min_cap), min_cap)
-    config.attn_linear_L = min(getattr(config, "attn_linear_L", config.attn_linear_L_base), config.attn_linear_L_max)
+    config.attn_linear_L_min = min(
+        getattr(config, "attn_linear_L_min", min_cap), min_cap)
+    config.attn_linear_L = min(getattr(
+        config, "attn_linear_L", config.attn_linear_L_base), config.attn_linear_L_max)
+    if seq_len >= 262144:
+        config.attn_dna_enable = False
     if seq_len >= 4096:
-        if seq_len >= 32768:
+        if seq_len >= 1_048_576:
+            target_budget = 12.0
+        elif seq_len >= 32768:
             target_budget = 24.0
         elif seq_len >= 8192:
             target_budget = 140.0
         else:
             target_budget = 192.0
         current_budget = getattr(config, "attn_linear_mem_budget_mb", None)
-        config.attn_linear_mem_budget_mb = float(current_budget) if current_budget not in (None, 0) else target_budget
-        config.attn_linear_mem_budget_mb = min(config.attn_linear_mem_budget_mb, target_budget)
+        config.attn_linear_mem_budget_mb = float(
+            current_budget) if current_budget not in (None, 0) else target_budget
+        config.attn_linear_mem_budget_mb = min(
+            config.attn_linear_mem_budget_mb, target_budget)
         config.attn_linear_L_schedule = "mem_cap"
     else:
         config.attn_linear_L_schedule = "log"
@@ -307,7 +335,8 @@ def _prepare_dmoah_config(
     quantize: bool,
     memory_guard: bool,
 ) -> SimpleNamespace:
-    config = build_dmoah_config(seq_len, seq_high, d_model=d_model, quantize=quantize)
+    config = build_dmoah_config(
+        seq_len, seq_high, d_model=d_model, quantize=quantize)
     if memory_guard:
         config = _apply_memory_saving_overrides(config, seq_len)
     return config
@@ -354,7 +383,8 @@ def _instantiate_dmoah_model(
     alpha: float | None = None
     if hasattr(model, "set_flux_alpha"):
         seq_low_cfg = int(getattr(config, "attn_active_seq_low", 256) or 256)
-        switch_ctx_cfg = int(getattr(config, "attn_linear_switch_ctx", 8192) or 8192)
+        switch_ctx_cfg = int(
+            getattr(config, "attn_linear_switch_ctx", 8192) or 8192)
         alpha = _flux_alpha_from_seq(
             seq_len=seq_len,
             seq_low=seq_low_cfg,
@@ -399,7 +429,8 @@ def _prime_linear_mode(
     if hasattr(model, "set_flux_alpha"):
         model.set_flux_alpha(1.0)
     model.to(device)
-    input_tensor = torch.randn(1, prime_len, d_model, device=device, dtype=torch.get_default_dtype())
+    input_tensor = torch.randn(
+        1, prime_len, d_model, device=device, dtype=torch.get_default_dtype())
     with torch.inference_mode():
         _ = model(input_tensor)
     torch.cuda.synchronize()
@@ -431,7 +462,8 @@ def estimate_safe_length(label: str,
                 probe_runs = 3
         else:
             probe_runs = min(3, max(1, 4096 // max(1, seq_len)))
-        print(f"[Probe] {label} testing seq_len={seq_len} batch={batch_eff} runs={probe_runs}", flush=True)
+        print(
+            f"[Probe] {label} testing seq_len={seq_len} batch={batch_eff} runs={probe_runs}", flush=True)
         try:
             benchmark_forward_pass(model, input_tensor, num_runs=probe_runs)
             safe = seq_len
@@ -439,7 +471,8 @@ def estimate_safe_length(label: str,
             message = str(exc)
             lower = message.lower()
             if "cuda" in message or "out of memory" in lower:
-                print(f"[Probe] {label} failed at sequence length {seq_len}: {message.splitlines()[-1]}")
+                print(
+                    f"[Probe] {label} failed at sequence length {seq_len}: {message.splitlines()[-1]}")
                 torch.cuda.empty_cache()
                 break
             raise
@@ -449,7 +482,8 @@ def estimate_safe_length(label: str,
                 torch.cuda.empty_cache()
 
     if safe is not None:
-        print(f"[Probe] {label} safe up to sequence length {safe} on this device.")
+        print(
+            f"[Probe] {label} safe up to sequence length {safe} on this device.")
     else:
         print(f"[Probe] {label} did not complete any probed lengths safely.")
     return safe
@@ -459,6 +493,7 @@ def estimate_safe_length(label: str,
 
 class StandardAttention(nn.Module):
     """A wrapper for a standard multi-head attention layer."""
+
     def __init__(self, config):
         super().__init__()
         # Use torch's built-in MHA which is highly optimized
@@ -477,24 +512,33 @@ class StandardAttention(nn.Module):
 
 # --- Main Benchmark Execution ---
 
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark DMoAH (Dynamic Mixture-of-Attention-Heads) kernels vs. standard attention."
     )
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Force device selection.")
-    parser.add_argument("--max-seq-len", type=int, default=None, help="Limit the maximum sequence length.")
-    parser.add_argument("--max-seq-count", type=int, default=None, help="Limit the number of sequence lengths to evaluate.")
+    parser.add_argument(
+        "--device", choices=["auto", "cpu", "cuda"], default="auto", help="Force device selection.")
+    parser.add_argument("--max-seq-len", type=int, default=None,
+                        help="Limit the maximum sequence length.")
+    parser.add_argument("--max-seq-count", type=int, default=None,
+                        help="Limit the number of sequence lengths to evaluate.")
     parser.add_argument(
         "--gpu-cap",
         type=int,
         default=DEFAULT_GPU_SEQUENCE_CAP,
         help="Maximum sequence length explored on GPU when --max-seq-len is not provided (default: 10,000,000).",
     )
-    parser.add_argument("--disable-standard", action="store_true", help="Skip the dense attention baseline.")
-    parser.add_argument("--disable-int8", action="store_true", help="Disable the INT8 variant.")
-    parser.add_argument("--skip-probe", action="store_true", help="Skip allocation probes that search for safe lengths.")
-    parser.add_argument("--report-dir", type=Path, default=None, help="Override the directory where JSON summaries are written.")
-    parser.add_argument("--no-save", action="store_true", help="Disable writing JSON summaries to disk.")
+    parser.add_argument("--disable-standard", action="store_true",
+                        help="Skip the dense attention baseline.")
+    parser.add_argument("--disable-int8", action="store_true",
+                        help="Disable the INT8 variant.")
+    parser.add_argument("--skip-probe", action="store_true",
+                        help="Skip allocation probes that search for safe lengths.")
+    parser.add_argument("--report-dir", type=Path, default=None,
+                        help="Override the directory where JSON summaries are written.")
+    parser.add_argument("--no-save", action="store_true",
+                        help="Disable writing JSON summaries to disk.")
     parser.add_argument(
         "--memory-guard",
         action="store_true",
@@ -503,7 +547,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--cuda-bf16",
         action="store_true",
-        help="Switch CUDA default dtype to bfloat16 for the benchmark run.",
+        help="Switch CUDA default dtype to bfloat16 for the benchmark run (default behaviour).",
+    )
+    parser.add_argument(
+        "--cuda-fp32",
+        action="store_true",
+        help="Force CUDA default dtype to float32 (overrides the default bfloat16).",
     )
     return parser.parse_args(argv)
 
@@ -528,20 +577,27 @@ def main(argv: list[str] | None = None) -> None:
 
     device = resolve_device_choice(args.device)
 
+    if args.cuda_bf16 and args.cuda_fp32:
+        raise ValueError("Specify at most one of --cuda-bf16 or --cuda-fp32.")
+
+    use_bf16 = False
     if device.type == "cuda":
-        torch.set_default_dtype(torch.bfloat16 if args.cuda_bf16 else torch.float32)
+        use_bf16 = not args.cuda_fp32
+        if args.cuda_bf16:
+            use_bf16 = True
+        torch.set_default_dtype(torch.bfloat16 if use_bf16 else torch.float32)
 
     # --- Configuration ---
     # We will use the same d_model but vary the head configurations
     D_MODEL = 512
     BASE_BATCH_SIZE = 4
-    
+
     # Config for the standard model
     config_standard = SimpleNamespace(
         d_model=D_MODEL,
-        n_head=8 # A typical number of heads
+        n_head=8  # A typical number of heads
     )
-    
+
     # Sequence lengths to test
     base_sequence_lengths = [128, 256, 512, 1024, 2048, 4096]
     sequence_lengths = build_sequence_lengths(
@@ -571,6 +627,7 @@ def main(argv: list[str] | None = None) -> None:
                 d_model=D_MODEL,
                 model_factory=lambda _seq: StandardAttention(config_standard),
             )
+
         def _factory(seq: int) -> CausalDynamicAttention:
             model, _, _ = _instantiate_dmoah_model(
                 seq,
@@ -599,15 +656,19 @@ def main(argv: list[str] | None = None) -> None:
 
     std_limit_announced = False
     last_std_success = None
+    dtype_label = "BF16" if use_bf16 else "FP32"
+    dtype_key = "bf16" if use_bf16 else "fp32"
     variant_configs = [
-        ("DMoAH (FP32)", False, "fp"),
+        (f"DMoAH ({dtype_label})", False, dtype_key),
         ("DMoAH (INT8)", True, "int8"),
     ]
     if args.disable_int8:
         variant_configs = [entry for entry in variant_configs if not entry[1]]
-    linear_trigger = min((seq for seq in sequence_lengths if seq >= 8192), default=None)
+    linear_trigger = min(
+        (seq for seq in sequence_lengths if seq >= 8192), default=None)
     if device.type == 'cuda' and linear_trigger is not None:
-        print(f"[Warmup] Priming flux kernel at seq_len={linear_trigger}...", flush=True)
+        print(
+            f"[Warmup] Priming flux kernel at seq_len={linear_trigger}...", flush=True)
         for _, quantize, _ in variant_configs:
             _prime_linear_mode(
                 device=device,
@@ -625,7 +686,8 @@ def main(argv: list[str] | None = None) -> None:
         batch_eff = _effective_batch_size(seq_len, BASE_BATCH_SIZE)
         input_tensor = torch.randn(batch_eff, seq_len, D_MODEL)
 
-        run_standard = (not args.disable_standard) and (safe_std is None or seq_len <= safe_std or device.type != 'cuda')
+        run_standard = (not args.disable_standard) and (
+            safe_std is None or seq_len <= safe_std or device.type != 'cuda')
         std_record = {
             "seq_len": seq_len,
             "model": "standard",
@@ -670,7 +732,8 @@ def main(argv: list[str] | None = None) -> None:
             if not std_limit_announced:
                 hit_at = seq_len
                 prior = last_std_success if last_std_success is not None else "<unknown>"
-                print(f"[Notice] Standard attention hit its limit at seq_len={hit_at} (last safe ~{prior}).")
+                print(
+                    f"[Notice] Standard attention hit its limit at seq_len={hit_at} (last safe ~{prior}).")
                 std_limit_announced = True
         if run_standard:
             std_tokens = f"{tokens_std:<15.2f}"
@@ -681,7 +744,8 @@ def main(argv: list[str] | None = None) -> None:
         runs_summary.append(std_record)
 
         for variant_label, quantize, variant_key in variant_configs:
-            run_variant = variant_active[variant_key] and (safe_dmoah is None or seq_len <= safe_dmoah or device.type != 'cuda')
+            run_variant = variant_active[variant_key] and (
+                safe_dmoah is None or seq_len <= safe_dmoah or device.type != 'cuda')
             record = {
                 "seq_len": seq_len,
                 "model": f"dmoah_{variant_key}",
@@ -715,9 +779,12 @@ def main(argv: list[str] | None = None) -> None:
                 mode_setting = getattr(config_dmoah, "attn_mode", "auto")
                 flux_alpha = alpha_override
                 if flux_alpha is None:
-                    seq_low_cfg = int(getattr(config_dmoah, "attn_active_seq_low", 256) or 256)
-                    switch_ctx_cfg = int(getattr(config_dmoah, "attn_linear_switch_ctx", 8192) or 8192)
-                    flux_alpha = _flux_alpha_from_seq(seq_len=seq_len, seq_low=seq_low_cfg, switch_ctx=switch_ctx_cfg)
+                    seq_low_cfg = int(
+                        getattr(config_dmoah, "attn_active_seq_low", 256) or 256)
+                    switch_ctx_cfg = int(
+                        getattr(config_dmoah, "attn_linear_switch_ctx", 8192) or 8192)
+                    flux_alpha = _flux_alpha_from_seq(
+                        seq_len=seq_len, seq_low=seq_low_cfg, switch_ctx=switch_ctx_cfg)
 
                 model_dmoah.to(device)
                 model_dmoah.eval()
@@ -739,7 +806,8 @@ def main(argv: list[str] | None = None) -> None:
                         if not dmoah_limit_announced[variant_key]:
                             prior = variant_last_success[variant_key]
                             info = prior if prior is not None else "<unknown>"
-                            print(f"[Notice] {variant_label} hit its limit at seq_len={seq_len} (last safe ~{info}).")
+                            print(
+                                f"[Notice] {variant_label} hit its limit at seq_len={seq_len} (last safe ~{info}).")
                             dmoah_limit_announced[variant_key] = True
                     else:
                         raise
@@ -748,9 +816,12 @@ def main(argv: list[str] | None = None) -> None:
                     backend_info = get_last_backend_info()
                     backend_name = str(backend_info.get('name', 'unknown'))
                     details_raw = backend_info.get('details') or {}
-                    details = dict(details_raw) if isinstance(details_raw, dict) else {}
-                    last_stats = getattr(model_dmoah, 'last_head_stats', {}) or {}
-                    sparse_state = getattr(model_dmoah, '_last_sparse_state', {}) or {}
+                    details = dict(details_raw) if isinstance(
+                        details_raw, dict) else {}
+                    last_stats = getattr(
+                        model_dmoah, 'last_head_stats', {}) or {}
+                    sparse_state = getattr(
+                        model_dmoah, '_last_sparse_state', {}) or {}
                     backend_override = sparse_state.get('backend')
                     if backend_override:
                         backend_name = str(backend_override)
@@ -759,15 +830,20 @@ def main(argv: list[str] | None = None) -> None:
                             details['max_rows'] = sparse_state['max_rows']
                         if 'density' not in details and 'density' in sparse_state:
                             details['density'] = sparse_state['density']
-                    max_rows = details.get('max_rows') if isinstance(details, dict) else None
+                    max_rows = details.get('max_rows') if isinstance(
+                        details, dict) else None
                     if max_rows is None:
                         max_rows = last_stats.get('max_active_rows')
-                    target_k = last_stats.get('target_k') or last_stats.get('top_k')
+                    target_k = last_stats.get(
+                        'target_k') or last_stats.get('top_k')
                     density = last_stats.get('max_active_density')
                     unique_heads = last_stats.get('unique_heads')
-                    quantized_flag = sparse_state.get('quantized') if sparse_state else quantize
-                    dna_stats = last_stats.get('dna') if isinstance(last_stats, dict) else None
-                    token_keep = last_stats.get('token_keep_fraction') if isinstance(last_stats, dict) else None
+                    quantized_flag = sparse_state.get(
+                        'quantized') if sparse_state else quantize
+                    dna_stats = last_stats.get('dna') if isinstance(
+                        last_stats, dict) else None
+                    token_keep = last_stats.get('token_keep_fraction') if isinstance(
+                        last_stats, dict) else None
                     flux_alpha_val = last_stats.get("flux_alpha", flux_alpha)
                     parts: list[str] = []
                     if max_rows is not None:
@@ -795,7 +871,8 @@ def main(argv: list[str] | None = None) -> None:
                     active_k_display = "-" if target_k is None else f"{int(target_k)}"
                     token_keep_display = "-" if token_keep is None else f"{token_keep:.2f}"
                     variant_last_success[variant_key] = seq_len
-                    mode_display = str(last_stats.get('mode_selected') or last_stats.get('mode') or mode_setting or 'unknown')
+                    mode_display = str(last_stats.get('mode_selected') or last_stats.get(
+                        'mode') or mode_setting or 'unknown')
                     tokens_per_s = throughput * seq_len if throughput is not None else None
                 else:
                     backend_display = "dmoah-limit"
@@ -861,10 +938,12 @@ def main(argv: list[str] | None = None) -> None:
                     "flux_alpha": float(flux_alpha),
                 }
                 auto_logs.append(auto_log)
-                print(f"[AutoLog] captured {variant_label} seq_len={seq_len} backend={backend_name}")
+                print(
+                    f"[AutoLog] captured {variant_label} seq_len={seq_len} backend={backend_name}")
             else:
                 if device.type == 'cuda' and not dmoah_limit_announced[variant_key]:
-                    print(f"[Notice] {variant_label} skipping seq_len={seq_len} due to limit.")
+                    print(
+                        f"[Notice] {variant_label} skipping seq_len={seq_len} due to limit.")
                     dmoah_limit_announced[variant_key] = True
                 print(
                     f"{seq_len:<10} | {variant_label:<24} | {'OOM':<15} | {'-':<12} | {'-':<15} | {'-':<15} | {'-':<10} | {'-':<10} | {'-':<10} | {'dmoah-limit':<36}"
@@ -888,11 +967,13 @@ def main(argv: list[str] | None = None) -> None:
     if device.type == 'cuda':
         std_msg = safe_std if safe_std is not None else "none"
         dmoah_msg = safe_dmoah if safe_dmoah is not None else "none"
-        print(f"\n[Summary] Standard safe length: {std_msg}; DMoAH safe length: {dmoah_msg}.")
+        print(
+            f"\n[Summary] Standard safe length: {std_msg}; DMoAH safe length: {dmoah_msg}.")
     else:
         std_msg = dmoah_msg = "cpu"
 
-    std_last_safe = max((entry["seq_len"] for entry in runs_summary if entry.get("model") == "standard" and entry.get("status") == "ok"), default=None)
+    std_last_safe = max((entry["seq_len"] for entry in runs_summary if entry.get(
+        "model") == "standard" and entry.get("status") == "ok"), default=None)
     last_safe_variants = {
         key: max(
             (
@@ -918,6 +999,7 @@ def main(argv: list[str] | None = None) -> None:
         "runs": runs_summary,
     }
     safe_record["auto_logs"] = auto_logs
+
     def _estimate_alpha(model_key: str) -> float | None:
         points: list[tuple[float, float]] = []
         for entry in runs_summary:
@@ -930,8 +1012,10 @@ def main(argv: list[str] | None = None) -> None:
         if len(points) < 2:
             return None
         points = points[-3:]
-        xs = torch.tensor([math.log(p[0]) for p in points], dtype=torch.float64)
-        ys = torch.tensor([math.log(p[1]) for p in points], dtype=torch.float64)
+        xs = torch.tensor([math.log(p[0])
+                          for p in points], dtype=torch.float64)
+        ys = torch.tensor([math.log(p[1])
+                          for p in points], dtype=torch.float64)
         denom = xs.var(unbiased=False)
         if denom <= 0:
             return None
@@ -963,7 +1047,8 @@ def main(argv: list[str] | None = None) -> None:
             relative_summary_path = summary_path.relative_to(PROJECT_ROOT)
         except ValueError:
             relative_summary_path = summary_path
-        print(f"\n[Summary] Detailed JSON report saved to {relative_summary_path}")
+        print(
+            f"\n[Summary] Detailed JSON report saved to {relative_summary_path}")
     else:
         print("\n[Summary] JSON report saving disabled for this run.")
     if auto_logs:

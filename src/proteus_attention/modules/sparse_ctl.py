@@ -58,7 +58,8 @@ class SparseHeadController:
 
         self._apply_bounds(self._global_min, self._global_max)
         if self._dense_threshold is not None:
-            self._layer._dense_threshold = float(max(0.0, min(self._dense_threshold, 1.0)))
+            self._layer._dense_threshold = float(
+                max(0.0, min(self._dense_threshold, 1.0)))
 
     @property
     def last_snapshot(self) -> Optional[SparseCtlSnapshot]:
@@ -135,7 +136,8 @@ class SparseHeadController:
         if max_heads is not None:
             max_val = max(layer.h_active_min, min(int(max_heads), int(total)))
             layer.h_active_max = max_val
-        layer.h_active = max(layer.h_active_min, min(layer.h_active, layer.h_active_max))
+        layer.h_active = max(layer.h_active_min, min(
+            layer.h_active, layer.h_active_max))
 
     def _adjust_heads(self, delta: int) -> None:
         layer = self._layer
@@ -152,6 +154,8 @@ class SparseHeadController:
         changed = self._apply_bounds(proposed_min, proposed_max)
         if changed and hasattr(layer, "adjust_linear_L_scale"):
             if delta < 0:
-                layer.adjust_linear_L_scale(getattr(layer, "linear_latency_shrink", 0.8))
+                layer.adjust_linear_L_scale(
+                    getattr(layer, "linear_latency_shrink", 0.8))
             elif delta > 0:
-                layer.adjust_linear_L_scale(getattr(layer, "linear_latency_growth", 1.05))
+                layer.adjust_linear_L_scale(
+                    getattr(layer, "linear_latency_growth", 1.05))

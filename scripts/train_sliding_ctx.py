@@ -19,14 +19,14 @@ from typing import Iterator, List, Tuple
 import torch
 import torch.nn.functional as F
 
-from protean_forge.examples.dmoah_train import (  # type: ignore[attr-defined]
+from proteus_attention.examples.dmoah_train import (  # type: ignore[attr-defined]
     CharTokenizer,
     SimpleGPT,
     get_device,
     set_reproducible,
 )
-from protean_forge.kernels.sparse_attn import get_last_backend_info
-from protean_forge.models.dmoah import ModelConfig
+from proteus_attention.kernels.sparse_attn import get_last_backend_info
+from proteus_attention.models.dmoah import ModelConfig
 
 
 def _load_corpus(path: Path, limit: int | None = None) -> str:

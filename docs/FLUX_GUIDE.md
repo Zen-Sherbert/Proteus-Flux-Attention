@@ -30,7 +30,7 @@ runtime alpha. If you do nothing, the module derives `α` from
 behaviour:
 
 ```python
-from protean_forge.models.dmoah import ModelConfig, CausalDynamicAttention
+from proteus_attention.models.dmoah import ModelConfig, CausalDynamicAttention
 
 cfg = ModelConfig(d_model=512, n_head=16, attn_mode="auto")
 attn = CausalDynamicAttention(cfg)

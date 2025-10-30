@@ -10,9 +10,12 @@ path mirrors the behaviour for CPU execution or environments without Triton.
 
 from __future__ import annotations
 
+import json
 import os
+import time
 import warnings
-from typing import Dict, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -82,6 +85,118 @@ def get_last_backend_info() -> Dict[str, object]:
     return info
 
 
+_BLOCK_DEFAULT_CONFIG: Tuple[int, int, int] = (32, 64, 32)
+_BLOCK_CANDIDATES: List[Tuple[int, int, int]] = [
+    (16, 32, 16),
+    (32, 32, 16),
+    (32, 64, 16),
+    (32, 64, 32),
+    (64, 64, 32),
+    (64, 128, 32),
+    (64, 128, 64),
+    (128, 128, 64),
+]
+
+_CACHE_ENV_DIR = os.getenv("PROTEUS_CACHE_DIR")
+if _CACHE_ENV_DIR:
+    _CACHE_DIR = Path(_CACHE_ENV_DIR).expanduser()
+else:
+    try:
+        _CACHE_DIR = Path.home() / ".cache" / "proteus_attention"
+    except Exception:
+        _CACHE_DIR = Path.cwd() / ".proteus_attention_cache"
+_CACHE_FILE = _CACHE_DIR / "flux_block_config.json"
+_BLOCK_CONFIG_CACHE: Dict[str, Tuple[int, int, int]] = {}
+
+
+def _load_block_cache() -> None:
+    global _BLOCK_CONFIG_CACHE
+    if not _CACHE_FILE.exists():
+        _BLOCK_CONFIG_CACHE = {}
+        return
+    try:
+        with _CACHE_FILE.open("r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except Exception as exc:  # noqa: BLE001
+        warnings.warn(
+            f"Failed to read Proteus Attention block-size cache ({exc}); ignoring persisted values.",
+            RuntimeWarning,
+        )
+        _BLOCK_CONFIG_CACHE = {}
+        return
+    cache: Dict[str, Tuple[int, int, int]] = {}
+    for key, value in raw.items():
+        if (
+            isinstance(key, str)
+            and isinstance(value, (list, tuple))
+            and len(value) == 3
+        ):
+            try:
+                cfg = tuple(int(v) for v in value)
+            except (TypeError, ValueError):
+                continue
+            cache[key] = cfg  # type: ignore[assignment]
+    _BLOCK_CONFIG_CACHE = cache
+
+
+def _save_block_cache() -> None:
+    if not _BLOCK_CONFIG_CACHE:
+        return
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        serializable = {k: list(v) for k, v in _BLOCK_CONFIG_CACHE.items()}
+        with _CACHE_FILE.open("w", encoding="utf-8") as handle:
+            json.dump(serializable, handle, indent=2, sort_keys=True)
+    except Exception as exc:  # noqa: BLE001
+        warnings.warn(
+            f"Unable to persist Proteus Attention block-size cache ({exc}).",
+            RuntimeWarning,
+        )
+
+
+_load_block_cache()
+
+
+def _block_cache_key(device: torch.device, head_dim: int) -> str:
+    if device.type != "cuda":
+        return f"{device.type}|{head_dim}"
+    try:
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        name = torch.cuda.get_device_name(index)
+        cc_major, cc_minor = torch.cuda.get_device_capability(index)
+        capability = f"{cc_major}.{cc_minor}"
+    except Exception:
+        name = "cuda"
+        capability = "unknown"
+    return f"{name}|{capability}|hd{head_dim}"
+
+
+def _should_disable_autotune() -> bool:
+    flag = os.getenv("PROTEUS_TUNE_DISABLE", "")
+    return flag.strip().lower() in {"1", "true", "yes", "disable"}
+
+
+def _should_force_autotune() -> bool:
+    flag = os.getenv("PROTEUS_TUNE_FORCE", "")
+    return flag.strip().lower() in {"1", "true", "yes", "force"}
+
+
+def _candidate_block_configs(head_dim: int) -> List[Tuple[int, int, int]]:
+    viable: List[Tuple[int, int, int]] = []
+    for cfg in _BLOCK_CANDIDATES:
+        m, n, d = cfg
+        if d > head_dim and head_dim > 0:
+            continue
+        viable.append((m, n, d))
+    if not viable:
+        viable.append(_BLOCK_DEFAULT_CONFIG)
+    return viable
+
+
+def get_block_config_cache() -> Dict[str, Tuple[int, int, int]]:
+    """Return the currently cached block-size configurations."""
+
+    return dict(_BLOCK_CONFIG_CACHE)
 
 
 def _flux_prepare_dna_candidates(
@@ -687,6 +802,153 @@ def _should_try_triton(
     return True
 
 
+def _run_flux_attention_kernel(
+    block_cfg: Tuple[int, int, int],
+    *,
+    q_active: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    token_indices: torch.Tensor,
+    row_offsets: torch.Tensor,
+    mask: torch.Tensor,
+    cand: torch.Tensor,
+    lengths: torch.Tensor,
+    tokens: int,
+    head_dim: int,
+    scale: float,
+    dropout_seed: int,
+    dropout_offset: int,
+    dropout_p: float,
+    dropout_scale: float,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    max_cand: int,
+    use_candidates: bool,
+    has_mask: bool,
+    has_dropout: bool,
+    has_qscale: bool,
+    has_kscale: bool,
+    has_vscale: bool,
+    heads: int,
+    max_rows: int,
+) -> None:
+    q_active_stride0 = q_active.stride(0)
+    q_active_stride1 = q_active.stride(1)
+    k_stride0 = k.stride(0)
+    k_stride1 = k.stride(1)
+    k_stride2 = k.stride(2)
+    v_stride0 = v.stride(0)
+    v_stride1 = v.stride(1)
+    v_stride2 = v.stride(2)
+    out_stride0 = out.stride(0)
+    out_stride1 = out.stride(1)
+    out_stride2 = out.stride(2)
+    token_stride0 = token_indices.stride(0)
+    row_offsets_stride0 = row_offsets.stride(0)
+    mask_stride0 = mask.stride(0) if has_mask else 0
+    mask_stride1 = mask.stride(1) if has_mask else 0
+
+    block_m, block_n, block_d = block_cfg
+    grid = (
+        triton.cdiv(max_rows, block_m),
+        heads,
+    )
+    _flux_attention_kernel[grid](
+        q_active,
+        k,
+        v,
+        out,
+        token_indices,
+        row_offsets,
+        mask,
+        cand,
+        lengths,
+        q_active_stride0,
+        q_active_stride1,
+        k_stride0,
+        k_stride1,
+        k_stride2,
+        v_stride0,
+        v_stride1,
+        v_stride2,
+        out_stride0,
+        out_stride1,
+        out_stride2,
+        token_stride0,
+        row_offsets_stride0,
+        mask_stride0,
+        mask_stride1,
+        tokens,
+        head_dim,
+        scale,
+        dropout_seed,
+        dropout_offset,
+        dropout_p,
+        dropout_scale,
+        q_scale,
+        k_scale,
+        v_scale,
+        max_cand,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_D=block_d,
+        USE_CANDIDATES=int(use_candidates),
+        HAS_MASK=has_mask,
+        HAS_DROPOUT=has_dropout,
+        HAS_QSCALE=has_qscale,
+        HAS_KSCALE=has_kscale,
+        HAS_VSCALE=has_vscale,
+        num_warps=4,
+        num_stages=2,
+    )
+
+
+def _select_block_config(
+    device: torch.device,
+    head_dim: int,
+    benchmark_fn,
+) -> Tuple[int, int, int]:
+    default_cfg = _BLOCK_CONFIG_CACHE.get(
+        _block_cache_key(device, head_dim), _BLOCK_DEFAULT_CONFIG
+    )
+    if device.type != "cuda":
+        return default_cfg
+
+    key = _block_cache_key(device, head_dim)
+
+    if not _should_force_autotune() and key in _BLOCK_CONFIG_CACHE:
+        return _BLOCK_CONFIG_CACHE[key]
+    if _should_disable_autotune():
+        return _BLOCK_CONFIG_CACHE.get(key, default_cfg)
+
+    best_cfg: Optional[Tuple[int, int, int]] = None
+    best_time: Optional[float] = None
+
+    for cfg in _candidate_block_configs(head_dim):
+        try:
+            elapsed = benchmark_fn(cfg)
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(
+                f"Block configuration {cfg} failed during autotune ({exc}); skipping.",
+                RuntimeWarning,
+            )
+            continue
+        if elapsed is None:
+            continue
+        if best_time is None or elapsed < best_time:
+            best_time = elapsed
+            best_cfg = cfg
+
+    if best_cfg is None:
+        best_cfg = default_cfg
+
+    _BLOCK_CONFIG_CACHE[key] = best_cfg
+    _save_block_cache()
+    return best_cfg
+
+
 def _launch_triton_sparse_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -776,62 +1038,58 @@ def _launch_triton_sparse_attention(
         max_cand = 0
         use_candidates = False
 
-    grid = lambda META: (
-        triton.cdiv(max_rows, META["BLOCK_M"]),
-        heads,
+    kernel_args = dict(
+        q_active=q_active_contig,
+        k=k_contig,
+        v=v_contig,
+        token_indices=token_contig,
+        row_offsets=row_offsets_contig,
+        mask=mask,
+        cand=cand_contig,
+        lengths=len_contig,
+        tokens=tokens,
+        head_dim=head_dim,
+        scale=scale,
+        dropout_seed=dropout_seed,
+        dropout_offset=dropout_offset,
+        dropout_p=dropout_p,
+        dropout_scale=dropout_scale,
+        q_scale=q_scale_contig,
+        k_scale=k_scale_contig,
+        v_scale=v_scale_contig,
+        max_cand=max_cand,
+        use_candidates=use_candidates,
+        has_mask=has_mask,
+        has_dropout=has_dropout,
+        has_qscale=has_qscale,
+        has_kscale=has_kscale,
+        has_vscale=has_vscale,
+        heads=heads,
+        max_rows=max_rows,
     )
-    BLOCK_M = 32
-    BLOCK_N = 64
-    BLOCK_D = 32
 
-    _flux_attention_kernel[grid](
-        q_active_contig,
-        k_contig,
-        v_contig,
-        out,
-        token_contig,
-        row_offsets_contig,
-        mask,
-        cand_contig,
-        len_contig,
-        q_active_contig.stride(0),
-        q_active_contig.stride(1),
-        k_contig.stride(0),
-        k_contig.stride(1),
-        k_contig.stride(2),
-        v_contig.stride(0),
-        v_contig.stride(1),
-        v_contig.stride(2),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        token_contig.stride(0),
-        row_offsets_contig.stride(0),
-        mask.stride(0) if has_mask else 0,
-        mask.stride(1) if has_mask else 0,
-        tokens,
-        head_dim,
-        scale,
-        dropout_seed,
-        dropout_offset,
-        dropout_p,
-        dropout_scale,
-        q_scale_contig,
-        k_scale_contig,
-        v_scale_contig,
-        max_cand,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_D=BLOCK_D,
-        USE_CANDIDATES=int(use_candidates),
-        HAS_MASK=has_mask,
-        HAS_DROPOUT=has_dropout,
-        HAS_QSCALE=has_qscale,
-        HAS_KSCALE=has_kscale,
-        HAS_VSCALE=has_vscale,
-        num_warps=4,
-        num_stages=2,
-    )
+    device = q_contig.device
+
+    if device.type == "cuda":
+
+        def _benchmark(block_cfg: Tuple[int, int, int]) -> Optional[float]:
+            tmp_out = torch.empty_like(out)
+            torch.cuda.synchronize(device)
+            _run_flux_attention_kernel(block_cfg, out=tmp_out, **kernel_args)
+            torch.cuda.synchronize(device)
+            start = time.perf_counter()
+            _run_flux_attention_kernel(block_cfg, out=tmp_out, **kernel_args)
+            torch.cuda.synchronize(device)
+            return time.perf_counter() - start
+
+    else:
+
+        def _benchmark(block_cfg: Tuple[int, int, int]) -> Optional[float]:
+            return None
+
+    block_cfg = _select_block_config(device, head_dim, _benchmark)
+
+    _run_flux_attention_kernel(block_cfg, out=out, **kernel_args)
 
     return out
 

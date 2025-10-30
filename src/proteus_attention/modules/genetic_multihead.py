@@ -73,12 +73,21 @@ class CausalGeneticMultiheadAttention(nn.Module):
 
         config = ModelConfig(**cfg)
         self.attention = CausalGeneticAttention(config)
+        self.fallback_attention = nn.MultiheadAttention(
+            embed_dim=self.embed_dim,
+            num_heads=self.num_heads,
+            dropout=float(dropout),
+            bias=bool(bias),
+            batch_first=self.batch_first,
+        )
 
         if device is not None or dtype is not None:
             self.attention.to(device=device, dtype=dtype)
+            self.fallback_attention.to(device=device, dtype=dtype)
 
         if sparse_ctl_config:
-            self._sparse_ctl = SparseHeadController(self.attention, **sparse_ctl_config)
+            self._sparse_ctl = SparseHeadController(
+                self.attention, **sparse_ctl_config)
 
     @staticmethod
     def _ensure_fastpath(x: torch.Tensor) -> torch.Tensor:
@@ -86,40 +95,33 @@ class CausalGeneticMultiheadAttention(nn.Module):
         return x if x.is_contiguous() else x.contiguous()
 
     @staticmethod
-    def _validate_attn_mask(
+    def _is_supported_attn_mask(
         attn_mask: Optional[torch.Tensor],
         seq_len: int,
         device: torch.device,
-    ) -> None:
+    ) -> bool:
         """
-        Ensure the provided ``attn_mask`` is compatible with the current
-        implementation.  We accept ``None`` or the standard causal mask; custom
-        masks will raise ``NotImplementedError`` so callers know the semantics
-        cannot be preserved yet.
+        Return ``True`` when the provided ``attn_mask`` matches the standard
+        causal pattern we can accelerate directly. Any other mask should fall
+        back to the dense PyTorch implementation to preserve semantics.
         """
         if attn_mask is None:
-            return
+            return True
 
         mask = attn_mask
         if mask.dim() == 3 and mask.size(0) == 1:
             mask = mask.squeeze(0)
         if mask.dim() != 2 or mask.size(0) != seq_len or mask.size(1) != seq_len:
-            raise NotImplementedError(
-                "CausalGeneticMultiheadAttention currently supports attn_mask of shape (target_len, source_len)."
-            )
+            return False
 
         if mask.dtype == torch.bool:
             mask_bool = mask.to(torch.bool, copy=False)
         else:
             mask_bool = torch.isinf(mask).to(torch.bool)
 
-        expected = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
-        if torch.equal(mask_bool.to(device), expected):
-            return
-
-        raise NotImplementedError(
-            "Only standard causal masks are supported right now. Custom attn_mask patterns are not yet implemented."
-        )
+        expected = torch.triu(torch.ones(
+            seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
+        return torch.equal(mask_bool.to(device), expected)
 
     def forward(
         self,
@@ -134,23 +136,67 @@ class CausalGeneticMultiheadAttention(nn.Module):
         *,
         return_stats: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        fallback_reason: Optional[str] = None
         if key is not None and key is not query:
-            raise NotImplementedError("Only self-attention is supported (key == query).")
+            fallback_reason = "cross_attention"
         if value is not None and value is not query:
-            raise NotImplementedError("Only self-attention is supported (value == query).")
+            fallback_reason = fallback_reason or "cross_attention"
         if is_causal is not None and not is_causal:
-            raise NotImplementedError("Non-causal attention is not supported by CausalGeneticMultiheadAttention.")
+            fallback_reason = fallback_reason or "non_causal"
+
+        if self.batch_first:
+            batch, seq_len, _ = query.shape
+        else:
+            seq_len, batch, _ = query.shape
+
+        supported_mask = self._is_supported_attn_mask(
+            attn_mask, seq_len, query.device)
+        if not supported_mask:
+            fallback_reason = fallback_reason or "custom_attn_mask"
+
+        if fallback_reason is not None:
+            fallback = self.fallback_attention.to(
+                device=query.device, dtype=query.dtype)
+            out, attn_weights = fallback(
+                query,
+                query if key is None else key,
+                query if value is None else value,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                attn_mask=attn_mask,
+                average_attn_weights=average_attn_weights,
+                is_causal=is_causal,
+            )
+
+            want_stats = self._return_stats_default if return_stats is None else bool(
+                return_stats)
+            if want_stats:
+                stats: Dict[str, Any] = {
+                    "head_stats": None,
+                    "sparse_state": None,
+                    "shortlist_backend": {
+                        "name": "torch.nn.MultiheadAttention",
+                        "details": {"reason": fallback_reason},
+                    },
+                }
+                if self._sparse_ctl is not None:
+                    stats["sparse_ctl"] = None
+                self._last_runtime_stats = stats
+            else:
+                self._last_runtime_stats = None
+
+            return out, attn_weights
 
         x = query if self.batch_first else query.transpose(0, 1)
         x = self._ensure_fastpath(x)
         batch, seq_len, _ = x.shape
         device = x.device
 
-        self._validate_attn_mask(attn_mask, seq_len, device)
-
+        # Supported mask already ensured; nothing to validate here.
         if key_padding_mask is not None:
             if key_padding_mask.dim() != 2 or key_padding_mask.size(1) != seq_len:
-                raise ValueError("key_padding_mask must have shape (batch, seq_len).")
+                raise ValueError(
+                    "key_padding_mask must have shape (batch, seq_len).")
             padding = key_padding_mask.to(device=device).unsqueeze(-1)
             x = x.masked_fill(padding, 0.0)
 
@@ -167,9 +213,11 @@ class CausalGeneticMultiheadAttention(nn.Module):
             if average_attn_weights:
                 attn_weights = attn_output.new_zeros(batch, seq_len, seq_len)
             else:
-                attn_weights = attn_output.new_zeros(batch * self.num_heads, seq_len, seq_len)
+                attn_weights = attn_output.new_zeros(
+                    batch * self.num_heads, seq_len, seq_len)
 
-        want_stats = self._return_stats_default if return_stats is None else bool(return_stats)
+        want_stats = self._return_stats_default if return_stats is None else bool(
+            return_stats)
         head_stats = getattr(self.attention, "last_head_stats", None)
         ctl_snapshot: Optional[SparseCtlSnapshot] = None
         if self._sparse_ctl is not None:

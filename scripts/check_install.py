@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Quick sanity check for Protean Forge installations.
+Quick sanity check for Proteus Attention installations.
 
 The script validates that PyTorch and Triton (when available) can import the
 Proteus Flux-enabled attention modules, then runs a tiny forward pass on CPU and, if a
@@ -23,7 +23,7 @@ if SRC_ROOT.exists():
 
 import torch
 
-from protean_forge.models.dmoah import CausalDynamicAttention, ModelConfig
+from proteus_attention.models.dmoah import CausalDynamicAttention, ModelConfig
 
 
 @dataclass
@@ -70,7 +70,7 @@ def _run_smoke(device: torch.device, *, flux_alpha: float) -> CheckResult:
 
 
 def main(argv: Iterable[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Validate Protean Forge installation.")
+    parser = argparse.ArgumentParser(description="Validate Proteus Attention installation.")
     parser.add_argument(
         "--no-gpu",
         action="store_true",
@@ -95,7 +95,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     if failed:
         print("\nOne or more checks failed. See messages above.", file=sys.stderr)
         return 1
-    print("\nAll Protean Forge smoke tests passed.")
+    print("\nAll Proteus Attention smoke tests passed.")
     return 0
 
 

@@ -2,6 +2,11 @@
 # /examples/train_comparison.py
 # Compare Genetic Attention (DMoAH) vs Standard Attention on a tiny char dataset.
 
+from proteus_attention.models.dmoah import (
+    ModelConfig,
+    AttentionBlock as DMoAH_AttentionBlock,
+    CausalDynamicAttention,
+)
 import argparse
 import json
 import time
@@ -29,13 +34,9 @@ sys.path.insert(0, str(project_root / 'src'))
 # kernels/     -> sparse_attn.py, tinytoy.py  (not required here, but present)
 # examples/    -> this script
 # ------------------------------------------------------------------------------
-from protean_forge.models.dmoah import (
-    ModelConfig,
-    AttentionBlock as DMoAH_AttentionBlock,
-    CausalDynamicAttention,
-)
 
 # ------------------------------ Utilities -------------------------------------
+
 
 def get_device():
     """Prefer CUDA (incl. ROCm), otherwise CPU. MPS is unsupported for Genetic Attention/DMoAH Triton kernels."""
@@ -43,6 +44,7 @@ def get_device():
         return torch.device("cuda")
     # MPS is not supported by Triton/your kernels; fall back to CPU if that's all there is.
     return torch.device("cpu")
+
 
 def set_reproducible(seed: int = 1337):
     torch.manual_seed(seed)
@@ -60,8 +62,10 @@ def set_reproducible(seed: int = 1337):
 
 # ------------------------------ Tokenizer & Data ------------------------------
 
+
 class CharTokenizer:
     """Tiny character-level tokenizer (demo-quality)."""
+
     def __init__(self, text: str):
         self.chars = sorted(list(set(text)))
         self.vocab_size = len(self.chars)
@@ -74,8 +78,10 @@ class CharTokenizer:
     def decode(self, ids):
         return "".join(self.itos[i] for i in ids)
 
+
 class TextDataset(Dataset):
     """Autoregressive next-char dataset with block_size contexts."""
+
     def __init__(self, text: str, tokenizer: CharTokenizer, block_size: int):
         self.tok = tokenizer
         self.block = block_size
@@ -92,8 +98,10 @@ class TextDataset(Dataset):
 
 # ------------------------------ Baseline Model --------------------------------
 
+
 class StandardAttention(nn.Module):
     """Causal MultiheadAttention wrapper using a bulletproof causal mask."""
+
     def __init__(self, d_model: int, n_head: int, p_dropout: float, bias: bool):
         super().__init__()
         self.attn = nn.MultiheadAttention(
@@ -115,6 +123,7 @@ class StandardAttention(nn.Module):
         out, _ = self.attn(x, x, x, attn_mask=causal, need_weights=False)
         return self.dropout(self.proj(out))
 
+
 class StandardAttentionBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int, p_dropout: float, bias: bool):
         super().__init__()
@@ -135,8 +144,10 @@ class StandardAttentionBlock(nn.Module):
 
 # ------------------------------ GPT-ish Wrapper -------------------------------
 
+
 class SimpleGPT(nn.Module):
     """Minimal GPT-ish stack with either Genetic (DMoAH) blocks or standard blocks."""
+
     def __init__(self, config, model_type: str = "dmoah"):
         super().__init__()
         assert model_type in ("dmoah", "standard")
@@ -148,7 +159,8 @@ class SimpleGPT(nn.Module):
         blocks = []
         if model_type == "dmoah":
             for _ in range(config.n_layer):
-                blocks.append(DMoAH_AttentionBlock(config))  # from models/dmoah.py
+                # from models/dmoah.py
+                blocks.append(DMoAH_AttentionBlock(config))
         else:
             for _ in range(config.n_layer):
                 blocks.append(
@@ -263,10 +275,12 @@ class _HeadStatsAggregator:
                 if key not in self.INTEREST_KEYS and key != "dna":
                     continue
                 if key == "dna" and isinstance(value, dict):
-                    self._update_nested(value, self._dna_totals, self._dna_counts)
+                    self._update_nested(
+                        value, self._dna_totals, self._dna_counts)
                     continue
                 if isinstance(value, (int, float)):
-                    self._totals[key] = self._totals.get(key, 0.0) + float(value)
+                    self._totals[key] = self._totals.get(
+                        key, 0.0) + float(value)
                     self._counts[key] = self._counts.get(key, 0) + 1
 
     @staticmethod
@@ -300,7 +314,7 @@ class _HeadStatsAggregator:
         if key in self._totals and self._counts.get(key):
             return self._totals[key] / self._counts[key]
         if key.startswith("dna_"):
-            raw = key[len("dna_") :]
+            raw = key[len("dna_"):]
             if raw in self._dna_totals and self._dna_counts.get(raw):
                 return self._dna_totals[raw] / self._dna_counts[raw]
         return None
@@ -328,12 +342,16 @@ class SparseController:
         self.verbose = verbose
         self._above = 0
         self._below = 0
-        self._global_min = min_heads if (min_heads is not None and min_heads > 0) else None
-        self._global_max = max_heads if (max_heads is not None and max_heads > 0) else None
-        self._dense_threshold = None if dense_threshold is None else float(max(0.0, min(dense_threshold, 1.0)))
+        self._global_min = min_heads if (
+            min_heads is not None and min_heads > 0) else None
+        self._global_max = max_heads if (
+            max_heads is not None and max_heads > 0) else None
+        self._dense_threshold = None if dense_threshold is None else float(
+            max(0.0, min(dense_threshold, 1.0)))
         self._current_min, self._current_max = self._snapshot_bounds()
         if self._dense_threshold is not None and self.verbose:
-            print(f"  [SparseCtrl] force_dense_threshold set to {self._dense_threshold:.3f}")
+            print(
+                f"  [SparseCtrl] force_dense_threshold set to {self._dense_threshold:.3f}")
         # Apply initial overrides if requested.
         if self._global_min is not None or self._global_max is not None:
             self._apply_bounds(self._global_min, self._global_max)
@@ -363,18 +381,21 @@ class SparseController:
                     changed = True
                 layer.h_active_min = new_min
             if max_heads is not None:
-                new_max = max(layer.h_active_min, min(max_heads, layer.h_total))
+                new_max = max(layer.h_active_min, min(
+                    max_heads, layer.h_total))
                 if new_max != layer.h_active_max:
                     changed = True
                 layer.h_active_max = new_max
-            layer.h_active = max(layer.h_active_min, min(layer.h_active, layer.h_active_max))
+            layer.h_active = max(layer.h_active_min, min(
+                layer.h_active, layer.h_active_max))
             if self._dense_threshold is not None:
                 layer._dense_threshold = float(self._dense_threshold)
         if layers:
             self._current_min = layers[0].h_active_min
             self._current_max = layers[0].h_active_max
         if changed and self.verbose:
-            print(f"  [SparseCtrl] Head bounds -> min={self._current_min} max={self._current_max}")
+            print(
+                f"  [SparseCtrl] Head bounds -> min={self._current_min} max={self._current_max}")
         return changed
 
     def maybe_adjust(
@@ -472,7 +493,8 @@ def train_model(model: nn.Module,
                 max_steps: Optional[int] = None) -> TrainResult:
     """Mixed-precision friendly trainer with optional Genetic Attention telemetry/control."""
     use_cuda_amp = bool(use_amp and device.type == "cuda")
-    scaler = torch.cuda.amp.GradScaler(enabled=use_cuda_amp) if use_cuda_amp else None
+    scaler = torch.cuda.amp.GradScaler(
+        enabled=use_cuda_amp) if use_cuda_amp else None
     if use_cuda_amp:
         def _autocast():
             return torch.cuda.amp.autocast(dtype=torch.bfloat16)
@@ -495,7 +517,8 @@ def train_model(model: nn.Module,
         n_batches = 0
         stats_agg = _HeadStatsAggregator() if log_head_stats else None
         for i, (x, y) in enumerate(dataloader):
-            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            x, y = x.to(device, non_blocking=True), y.to(
+                device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             with _autocast():
@@ -523,7 +546,8 @@ def train_model(model: nn.Module,
             n_batches += 1
 
             if i % 200 == 0:
-                print(f"Epoch {epoch}/{epochs} | Batch {i} | Loss {loss.item():.4f}")
+                print(
+                    f"Epoch {epoch}/{epochs} | Batch {i} | Loss {loss.item():.4f}")
 
             if max_steps is not None and global_step >= max_steps:
                 reached_limit = True
@@ -551,13 +575,15 @@ def train_model(model: nn.Module,
     elapsed = time.time() - t0
     print(f"Training finished in {elapsed:.2f}s ({global_step} steps).")
     if last_epoch_avg is not None:
-        print(f"{model_name} summary: steps={global_step}, avg_loss={last_epoch_avg:.4f}")
+        print(
+            f"{model_name} summary: steps={global_step}, avg_loss={last_epoch_avg:.4f}")
     return TrainResult(
         steps=global_step,
         avg_loss=last_epoch_avg,
         elapsed=elapsed,
         epochs_completed=epochs_completed,
     )
+
 
 @torch.no_grad()
 def generate_text(model: nn.Module,
@@ -566,7 +592,8 @@ def generate_text(model: nn.Module,
                   prompt: str = "Hello",
                   num_tokens: int = 200):
     model.eval()
-    start = torch.tensor(tokenizer.encode(prompt), dtype=torch.long, device=device).unsqueeze(0)
+    start = torch.tensor(tokenizer.encode(
+        prompt), dtype=torch.long, device=device).unsqueeze(0)
     out = model.generate(start, max_new_tokens=num_tokens)
     txt = tokenizer.decode(out[0].tolist())
     print("-" * 80)
@@ -575,8 +602,10 @@ def generate_text(model: nn.Module,
 
 # --------------------------------- Main ---------------------------------------
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Train and compare Genetic Attention (DMoAH) vs Standard Attention.")
+    parser = argparse.ArgumentParser(
+        description="Train and compare Genetic Attention (DMoAH) vs Standard Attention.")
     parser.add_argument("text_file", nargs="?", default="input.txt",
                         help="Path to training text (default: input.txt; downloads Tiny Shakespeare if missing).")
     parser.add_argument("--epochs", type=int, default=1)
@@ -585,26 +614,46 @@ def main():
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--n_layer", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--compile", action="store_false", dest="no_compile", help="Enable torch.compile if available (may be unstable with custom models).")
-    parser.add_argument("--no_amp", action="store_true", help="Disable AMP even on CUDA.")
-    parser.add_argument("--gen_tokens", type=int, default=200, help="Tokens to generate after training each model.")
-    parser.add_argument("--target_density", type=float, default=0.28, help="Desired average max_active_density for Genetic Attention (DMoAH) (0-1).")
-    parser.add_argument("--density_tol", type=float, default=0.03, help="Tolerance band around target density before adjustments.")
-    parser.add_argument("--density_patience", type=int, default=1, help="Epochs the density can stay out-of-band before adjusting heads.")
-    parser.add_argument("--min_active_heads", type=int, default=0, help="Override minimum active heads (0 keeps config default).")
-    parser.add_argument("--max_active_heads", type=int, default=0, help="Override maximum active heads (0 keeps config default).")
-    parser.add_argument("--dense_threshold", type=float, default=0.30, help="Force-dense threshold passed to Genetic Attention (DMoAH) (0-1).")
-    parser.add_argument("--no_sparse_ctrl", action="store_true", help="Disable adaptive sparse controller adjustments.")
-    parser.add_argument("--token_sparse", action="store_true", help="Enable token-level sparsity routing.")
-    parser.add_argument("--token_keep_ratio", type=float, default=0.85, help="Fraction of tokens to keep when token sparsity is enabled (0-1).")
-    parser.add_argument("--token_keep_min", type=int, default=8, help="Minimum tokens to keep per sequence when token sparsity is enabled.")
-    parser.add_argument("--token_keep_threshold", type=float, default=0.0, help="DNA/importance threshold for keeping tokens.")
-    parser.add_argument("--token_keep_guard", type=int, default=1, help="Always keep the first N tokens in each sequence.")
-    parser.add_argument("--genetic_steps", type=int, default=0, help="Maximum training steps for the Genetic Attention run (0 uses all batches).")
-    parser.add_argument("--dmoah_steps", type=int, default=0, help=argparse.SUPPRESS)
-    parser.add_argument("--standard_steps", type=int, default=0, help="Maximum training steps for the standard baseline (0 uses all batches).")
-    parser.add_argument("--summary_json", type=str, default="", help="Optional path to append JSON summary of this comparison.")
-    parser.add_argument("--run_label", type=str, default="", help="Identifier label for the summary entry (defaults to context/batch info).")
+    parser.add_argument("--compile", action="store_false", dest="no_compile",
+                        help="Enable torch.compile if available (may be unstable with custom models).")
+    parser.add_argument("--no_amp", action="store_true",
+                        help="Disable AMP even on CUDA.")
+    parser.add_argument("--gen_tokens", type=int, default=200,
+                        help="Tokens to generate after training each model.")
+    parser.add_argument("--target_density", type=float, default=0.28,
+                        help="Desired average max_active_density for Genetic Attention (DMoAH) (0-1).")
+    parser.add_argument("--density_tol", type=float, default=0.03,
+                        help="Tolerance band around target density before adjustments.")
+    parser.add_argument("--density_patience", type=int, default=1,
+                        help="Epochs the density can stay out-of-band before adjusting heads.")
+    parser.add_argument("--min_active_heads", type=int, default=0,
+                        help="Override minimum active heads (0 keeps config default).")
+    parser.add_argument("--max_active_heads", type=int, default=0,
+                        help="Override maximum active heads (0 keeps config default).")
+    parser.add_argument("--dense_threshold", type=float, default=0.30,
+                        help="Force-dense threshold passed to Genetic Attention (DMoAH) (0-1).")
+    parser.add_argument("--no_sparse_ctrl", action="store_true",
+                        help="Disable adaptive sparse controller adjustments.")
+    parser.add_argument("--token_sparse", action="store_true",
+                        help="Enable token-level sparsity routing.")
+    parser.add_argument("--token_keep_ratio", type=float, default=0.85,
+                        help="Fraction of tokens to keep when token sparsity is enabled (0-1).")
+    parser.add_argument("--token_keep_min", type=int, default=8,
+                        help="Minimum tokens to keep per sequence when token sparsity is enabled.")
+    parser.add_argument("--token_keep_threshold", type=float, default=0.0,
+                        help="DNA/importance threshold for keeping tokens.")
+    parser.add_argument("--token_keep_guard", type=int, default=1,
+                        help="Always keep the first N tokens in each sequence.")
+    parser.add_argument("--genetic_steps", type=int, default=0,
+                        help="Maximum training steps for the Genetic Attention run (0 uses all batches).")
+    parser.add_argument("--dmoah_steps", type=int,
+                        default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--standard_steps", type=int, default=0,
+                        help="Maximum training steps for the standard baseline (0 uses all batches).")
+    parser.add_argument("--summary_json", type=str, default="",
+                        help="Optional path to append JSON summary of this comparison.")
+    parser.add_argument("--run_label", type=str, default="",
+                        help="Identifier label for the summary entry (defaults to context/batch info).")
     args = parser.parse_args()
 
     device = get_device()
@@ -649,7 +698,8 @@ def main():
                         persistent_workers=(device.type == "cuda" and num_workers > 0))
 
     vocab = tokenizer.vocab_size
-    print(f"Corpus size: {len(text):,} chars | Vocab: {vocab} | Block size: {args.block_size}")
+    print(
+        f"Corpus size: {len(text):,} chars | Vocab: {vocab} | Block size: {args.block_size}")
 
     target_density = max(0.0, min(args.target_density, 1.0))
     density_tol = max(0.0, args.density_tol)
@@ -659,9 +709,11 @@ def main():
     if max_active < min_active:
         max_active = min_active
     token_sparse = bool(args.token_sparse)
-    token_keep_ratio = max(0.0, min(args.token_keep_ratio, 1.0)) if token_sparse else 1.0
+    token_keep_ratio = max(
+        0.0, min(args.token_keep_ratio, 1.0)) if token_sparse else 1.0
     token_keep_min = max(0, args.token_keep_min if token_sparse else 0)
-    token_keep_threshold = max(0.0, args.token_keep_threshold if token_sparse else 0.0)
+    token_keep_threshold = max(
+        0.0, args.token_keep_threshold if token_sparse else 0.0)
     token_keep_guard = max(0, args.token_keep_guard if token_sparse else 1)
 
     # ---------- Configs ----------
@@ -736,7 +788,7 @@ def main():
 
     # ---------- Optimizers ----------
     opt_dmoah = torch.optim.AdamW(model_dmoah.parameters(), lr=args.lr)
-    opt_std   = torch.optim.AdamW(model_std.parameters(), lr=args.lr)
+    opt_std = torch.optim.AdamW(model_std.parameters(), lr=args.lr)
 
     # ---------- Train DMoAH ----------
     result_dmoah = train_model(
@@ -785,7 +837,8 @@ def main():
             num_tokens=args.gen_tokens,
         )
 
-    run_label = args.run_label.strip() or f"ctx{args.block_size}_bs{args.batch_size}_d{args.d_model}_L{args.n_layer}"
+    run_label = args.run_label.strip(
+    ) or f"ctx{args.block_size}_bs{args.batch_size}_d{args.d_model}_L{args.n_layer}"
 
     def _result_summary(result: TrainResult) -> dict[str, float | int | None]:
         steps_per_sec = result.steps / result.elapsed if result.elapsed > 0 else None
@@ -824,7 +877,8 @@ def main():
     comp = {}
     if isinstance(d_elapsed, (int, float)) and isinstance(s_elapsed, (int, float)) and d_elapsed > 0:
         comp["standard_over_genetic_speedup"] = s_elapsed / d_elapsed
-        comp["genetic_over_standard_speedup"] = d_elapsed / s_elapsed if s_elapsed > 0 else None
+        comp["genetic_over_standard_speedup"] = d_elapsed / \
+            s_elapsed if s_elapsed > 0 else None
     if isinstance(d_loss, (int, float)) and isinstance(s_loss, (int, float)):
         comp["loss_delta_genetic_minus_standard"] = d_loss - s_loss
     summary_payload["comparisons"] = comp
@@ -841,13 +895,17 @@ def main():
                 elif isinstance(data, dict):
                     existing = [data]
             except json.JSONDecodeError:
-                print(f"Warning: could not parse existing JSON at {summary_path}; starting fresh.")
-        existing = [entry for entry in existing if entry.get("label") != run_label]
+                print(
+                    f"Warning: could not parse existing JSON at {summary_path}; starting fresh.")
+        existing = [entry for entry in existing if entry.get(
+            "label") != run_label]
         existing.append(summary_payload)
-        summary_path.write_text(json.dumps(existing, indent=2, sort_keys=True), encoding="utf-8")
+        summary_path.write_text(json.dumps(
+            existing, indent=2, sort_keys=True), encoding="utf-8")
         print(f"Run summary written to {summary_path}")
 
     print("\nComparison complete. Inspect loss trends and sample generations for qualitative differences.")
+
 
 if __name__ == "__main__":
     main()

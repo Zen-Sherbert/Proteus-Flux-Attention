@@ -94,7 +94,8 @@ class RMSNorm(nn.Module):
 def _build_norm(config: ModelConfig) -> nn.Module:
     """Return the configured normalisation layer (LayerNorm or RMSNorm)."""
 
-    norm_type = str(getattr(config, "norm_type", "layernorm") or "layernorm").lower()
+    norm_type = str(getattr(config, "norm_type", "layernorm")
+                    or "layernorm").lower()
     eps = float(getattr(config, "norm_eps", 1e-5))
     if norm_type == "rmsnorm":
         return RMSNorm(config.d_model, eps=eps)
@@ -108,9 +109,11 @@ class MLP(nn.Module):
         super().__init__()
         hidden_mult = int(getattr(config, "mlp_hidden_mult", 4))
         hidden_dim = hidden_mult * config.d_model
-        self.fc1 = nn.Linear(config.d_model, hidden_dim, bias=bool(config.bias))
+        self.fc1 = nn.Linear(config.d_model, hidden_dim,
+                             bias=bool(config.bias))
         self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden_dim, config.d_model, bias=bool(config.bias))
+        self.fc2 = nn.Linear(hidden_dim, config.d_model,
+                             bias=bool(config.bias))
         self.dropout = nn.Dropout(config.p_dropout)
         self.last_aux_loss: Optional[torch.Tensor] = None
 
@@ -146,9 +149,12 @@ class SwitchRouter(nn.Module):
         return indices, scores, probs
 
 # A new helper function for this module
+
+
 def _get_causal_mask(target_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     """Return an upper-triangular (causal) mask suitable for SDPA."""
-    mask = torch.full((target_len, target_len), float("-inf"), device=device, dtype=dtype)
+    mask = torch.full((target_len, target_len), float(
+        "-inf"), device=device, dtype=dtype)
     mask = torch.triu(mask, diagonal=1)
     return mask
 
@@ -161,19 +167,22 @@ class CausalDynamicAttention(nn.Module):
     select a small subset of "active" heads for each token, enabling massive
     scalability in the total number of heads.
     """
+
     def __init__(self, config: ModelConfig):
         super().__init__()
         # --- Standard Attention Setup ---
         self.d_model = config.d_model
         self.bias = bool(getattr(config, "bias", False))
-        
+
         # --- DMoAH configuration ---
-        total_heads_hint = int(getattr(config, "attn_h_total", 0) or getattr(config, "n_head", 1) or 1)
+        total_heads_hint = int(
+            getattr(config, "attn_h_total", 0) or getattr(config, "n_head", 1) or 1)
         if total_heads_hint <= 0:
             total_heads_hint = max(1, int(getattr(config, "n_head", 1)))
         self.h_total = total_heads_hint
         if self.d_model % self.h_total != 0:
-            raise ValueError("d_model must be divisible by the total number of attention heads (attn_h_total)")
+            raise ValueError(
+                "d_model must be divisible by the total number of attention heads (attn_h_total)")
 
         active_heads_hint = int(getattr(config, "attn_h_active", 0))
         if active_heads_hint <= 0 or active_heads_hint > self.h_total:
@@ -192,7 +201,8 @@ class CausalDynamicAttention(nn.Module):
         min_active_cfg = max(1, min(min_active_cfg, max_active_cfg))
         self.h_active_min = min_active_cfg
         self.h_active_max = max_active_cfg
-        self.h_active = max(self.h_active_min, min(base_active, self.h_active_max))
+        self.h_active = max(self.h_active_min, min(
+            base_active, self.h_active_max))
 
         curve_hint = getattr(config, "attn_active_curve", None)
         try:
@@ -202,46 +212,64 @@ class CausalDynamicAttention(nn.Module):
         if curve_val <= 0.0:
             curve_val = 1.0
         self.h_active_curve = curve_val
-        self.force_dense_when_full = bool(getattr(config, "attn_force_dense_when_full", False))
+        self.force_dense_when_full = bool(
+            getattr(config, "attn_force_dense_when_full", False))
 
         # The dimension of each individual head.
         self.d_head = self.d_model // self.h_total
 
         self.dropout = nn.Dropout(config.p_dropout)
-        self.use_sdpa = bool(getattr(config, "use_sdpa", True) and hasattr(F, "scaled_dot_product_attention"))
-        self.router_reg_lambda = float(getattr(config, "attn_router_lambda", 0.0) or 0.0)
-        self.router_reg_beta = float(getattr(config, "attn_router_beta", 1.0) or 1.0)
-        self.router_reg_mode = str(getattr(config, "attn_router_reg_mode", "entropy"))
+        self.use_sdpa = bool(getattr(config, "use_sdpa", True) and hasattr(
+            F, "scaled_dot_product_attention"))
+        self.router_reg_lambda = float(
+            getattr(config, "attn_router_lambda", 0.0) or 0.0)
+        self.router_reg_beta = float(
+            getattr(config, "attn_router_beta", 1.0) or 1.0)
+        self.router_reg_mode = str(
+            getattr(config, "attn_router_reg_mode", "entropy"))
         raw_mode = str(getattr(config, "attn_mode", "auto") or "auto").lower()
         if raw_mode not in {"auto", "subquad", "linear"}:
             raw_mode = "auto"
         self.mode_setting = raw_mode
-        self.linear_L = max(1, int(getattr(config, "attn_linear_L", 512) or 512))
-        schedule_raw = str(getattr(config, "attn_linear_L_schedule", "fixed") or "fixed").lower()
+        self.linear_L = max(
+            1, int(getattr(config, "attn_linear_L", 512) or 512))
+        schedule_raw = str(
+            getattr(config, "attn_linear_L_schedule", "fixed") or "fixed").lower()
         if schedule_raw not in {"fixed", "sqrt", "log", "mem_cap"}:
             schedule_raw = "fixed"
         self.linear_L_schedule = schedule_raw
-        base_L_cfg = int(getattr(config, "attn_linear_L_base", self.linear_L) or self.linear_L)
+        base_L_cfg = int(getattr(config, "attn_linear_L_base",
+                         self.linear_L) or self.linear_L)
         self.linear_L_base = max(1, base_L_cfg)
-        self.linear_L_min = max(1, int(getattr(config, "attn_linear_L_min", min(64, self.linear_L_base)) or min(64, self.linear_L_base)))
+        self.linear_L_min = max(1, int(getattr(config, "attn_linear_L_min", min(
+            64, self.linear_L_base)) or min(64, self.linear_L_base)))
         max_cfg = getattr(config, "attn_linear_L_max", self.linear_L)
-        self.linear_L_max = max(self.linear_L_min, int(max_cfg if max_cfg is not None else self.linear_L))
+        self.linear_L_max = max(self.linear_L_min, int(
+            max_cfg if max_cfg is not None else self.linear_L))
         scale_cfg = float(getattr(config, "attn_linear_L_scale", 1.0) or 1.0)
         self.linear_L_scale_init = max(0.1, float(scale_cfg))
-        self.linear_L_scale_max = float(getattr(config, "attn_linear_L_scale_max", max(1.0, self.linear_L_scale_init)) or max(1.0, self.linear_L_scale_init))
-        self._linear_scale_min = max(0.05, self.linear_L_min / max(1.0, self.linear_L_base))
+        self.linear_L_scale_max = float(getattr(config, "attn_linear_L_scale_max", max(
+            1.0, self.linear_L_scale_init)) or max(1.0, self.linear_L_scale_init))
+        self._linear_scale_min = max(
+            0.05, self.linear_L_min / max(1.0, self.linear_L_base))
         self._linear_L_scale_runtime = self.linear_L_scale_init
-        shrink_cfg = float(getattr(config, "attn_linear_latency_shrink", 0.8) or 0.8)
+        shrink_cfg = float(
+            getattr(config, "attn_linear_latency_shrink", 0.8) or 0.8)
         self.linear_latency_shrink = min(max(shrink_cfg, 0.1), 0.99)
-        growth_cfg = float(getattr(config, "attn_linear_latency_growth", 1.05) or 1.05)
+        growth_cfg = float(
+            getattr(config, "attn_linear_latency_growth", 1.05) or 1.05)
         self.linear_latency_growth = max(1.0, growth_cfg)
         mem_budget = getattr(config, "attn_linear_mem_budget_mb", None)
-        self.linear_mem_budget_mb = float(mem_budget) if mem_budget is not None else None
-        piece_local = float(getattr(config, "attn_linear_piece_local_frac", 0.6) or 0.6)
-        piece_anchor = float(getattr(config, "attn_linear_piece_anchor_frac", 0.3) or 0.3)
+        self.linear_mem_budget_mb = float(
+            mem_budget) if mem_budget is not None else None
+        piece_local = float(
+            getattr(config, "attn_linear_piece_local_frac", 0.6) or 0.6)
+        piece_anchor = float(
+            getattr(config, "attn_linear_piece_anchor_frac", 0.3) or 0.3)
         piece_local = max(0.0, min(1.0, piece_local))
         piece_anchor = max(0.0, min(1.0, piece_anchor))
-        piece_dna = float(getattr(config, "attn_linear_piece_dna_frac", max(0.0, 1.0 - piece_local - piece_anchor)))
+        piece_dna = float(getattr(config, "attn_linear_piece_dna_frac", max(
+            0.0, 1.0 - piece_local - piece_anchor)))
         piece_dna = max(0.0, min(1.0, piece_dna))
         total_piece = piece_local + piece_anchor + piece_dna
         if total_piece <= 0.0:
@@ -253,34 +281,44 @@ class CausalDynamicAttention(nn.Module):
         self.linear_piece_local_frac = piece_local
         self.linear_piece_anchor_frac = piece_anchor
         self.linear_piece_dna_frac = piece_dna
-        window_hint = int(getattr(config, "attn_linear_window", self.linear_L_base) or self.linear_L_base)
+        window_hint = int(getattr(config, "attn_linear_window",
+                          self.linear_L_base) or self.linear_L_base)
         if window_hint <= 0:
             window_hint = self.linear_L_base
         self.linear_window_base = max(1, window_hint)
         self.linear_window = self.linear_window_base
-        anchor_stride = int(getattr(config, "attn_linear_anchor_stride", getattr(config, "attn_linear_anchors_every", 256)) or 0)
+        anchor_stride = int(getattr(config, "attn_linear_anchor_stride", getattr(
+            config, "attn_linear_anchors_every", 256)) or 0)
         self.linear_anchor_stride = max(0, anchor_stride)
         head_k = int(getattr(config, "attn_linear_head_k", 2) or 2)
         self.linear_head_k = max(1, min(head_k, self.h_total))
-        switch_ctx = int(getattr(config, "attn_linear_switch_ctx", 20000) or 20000)
+        switch_ctx = int(
+            getattr(config, "attn_linear_switch_ctx", 20000) or 20000)
         self.linear_switch_ctx = max(0, switch_ctx)
         latency_budget = getattr(config, "attn_linear_latency_budget_ms", None)
-        self.linear_latency_budget_ms = float(latency_budget) if latency_budget is not None else None
-        linear_policy_raw = str(getattr(config, "attn_linear_policy", "local+anchors") or "local+anchors").lower()
-        tokens = {part.strip() for token in linear_policy_raw.replace("|", ",").replace("+", ",").split(",") for part in (token,) if token.strip()}
+        self.linear_latency_budget_ms = float(
+            latency_budget) if latency_budget is not None else None
+        linear_policy_raw = str(getattr(
+            config, "attn_linear_policy", "local+anchors") or "local+anchors").lower()
+        tokens = {part.strip() for token in linear_policy_raw.replace(
+            "|", ",").replace("+", ",").split(",") for part in (token,) if token.strip()}
         if not tokens:
             tokens = {"local", "anchors"}
         self.linear_policy_tokens = tokens
-        self.linear_use_anchors = any(name in tokens for name in {"anchors", "anchor", "global"})
-        self.linear_use_dna = any(name in tokens for name in {"dna", "semantic"})
-        self.linear_use_local = any(name in tokens for name in {"local", "window"}) or not (self.linear_use_anchors or self.linear_use_dna)
+        self.linear_use_anchors = any(name in tokens for name in {
+                                      "anchors", "anchor", "global"})
+        self.linear_use_dna = any(
+            name in tokens for name in {"dna", "semantic"})
+        self.linear_use_local = any(name in tokens for name in {"local", "window"}) or not (
+            self.linear_use_anchors or self.linear_use_dna)
         if not self.linear_use_local:
             self.linear_piece_local_frac = 0.0
         if not self.linear_use_anchors:
             self.linear_piece_anchor_frac = 0.0
         if not self.linear_use_dna:
             self.linear_piece_dna_frac = 0.0
-        piece_sum = self.linear_piece_local_frac + self.linear_piece_anchor_frac + self.linear_piece_dna_frac
+        piece_sum = self.linear_piece_local_frac + \
+            self.linear_piece_anchor_frac + self.linear_piece_dna_frac
         if piece_sum <= 0.0:
             self.linear_piece_local_frac = 1.0
             self.linear_piece_anchor_frac = 0.0
@@ -288,24 +326,32 @@ class CausalDynamicAttention(nn.Module):
         else:
             self.linear_piece_local_frac /= piece_sum
             self.linear_piece_anchor_frac /= piece_sum
-            self.linear_piece_dna_frac = max(0.0, 1.0 - self.linear_piece_local_frac - self.linear_piece_anchor_frac)
+            self.linear_piece_dna_frac = max(
+                0.0, 1.0 - self.linear_piece_local_frac - self.linear_piece_anchor_frac)
         self._linear_runtime: Optional[dict] = None
         self._linear_runtime_seq_len: Optional[int] = None
         self._current_mode: str = "subquad"
-        self.quantize_sparse_int8 = bool(getattr(config, "attn_quantize_int8", False))
-        quant_mode = str(getattr(config, "attn_quantize_int8_mode", "max") or "max").lower()
+        self.quantize_sparse_int8 = bool(
+            getattr(config, "attn_quantize_int8", False))
+        quant_mode = str(
+            getattr(config, "attn_quantize_int8_mode", "max") or "max").lower()
         if quant_mode not in {"max", "percentile", "ema_percentile"}:
             quant_mode = "max"
         self.quantize_sparse_int8_mode = quant_mode
-        percentile = float(getattr(config, "attn_quantize_int8_percentile", 1.0) or 1.0)
+        percentile = float(
+            getattr(config, "attn_quantize_int8_percentile", 1.0) or 1.0)
         percentile = min(max(percentile, 0.0), 1.0)
         self.quantize_sparse_int8_percentile = percentile
-        ema_decay = float(getattr(config, "attn_quantize_int8_ema_decay", 0.9) or 0.9)
+        ema_decay = float(
+            getattr(config, "attn_quantize_int8_ema_decay", 0.9) or 0.9)
         ema_decay = min(max(ema_decay, 0.0), 0.9999)
         self.quantize_sparse_int8_ema_decay = ema_decay
-        self.register_buffer("_quant_ema_q", torch.zeros(self.h_total, dtype=torch.float32), persistent=False)
-        self.register_buffer("_quant_ema_k", torch.zeros(self.h_total, dtype=torch.float32), persistent=False)
-        self.register_buffer("_quant_ema_v", torch.zeros(self.h_total, dtype=torch.float32), persistent=False)
+        self.register_buffer("_quant_ema_q", torch.zeros(
+            self.h_total, dtype=torch.float32), persistent=False)
+        self.register_buffer("_quant_ema_k", torch.zeros(
+            self.h_total, dtype=torch.float32), persistent=False)
+        self.register_buffer("_quant_ema_v", torch.zeros(
+            self.h_total, dtype=torch.float32), persistent=False)
         self._quant_ema_flags = {
             "_quant_ema_q": False,
             "_quant_ema_k": False,
@@ -316,14 +362,16 @@ class CausalDynamicAttention(nn.Module):
         if seq_low_cfg <= 0:
             seq_low_cfg = max(64, self.d_head)
         if seq_high_cfg <= 0:
-            seq_high_cfg = int(getattr(config, "n_ctx", 0) or (seq_low_cfg * 4))
+            seq_high_cfg = int(getattr(config, "n_ctx", 0)
+                               or (seq_low_cfg * 4))
         if seq_high_cfg < seq_low_cfg:
             seq_high_cfg = seq_low_cfg
         self.seq_low = seq_low_cfg
         self.seq_high = seq_high_cfg
         dense_cutoff_hint = getattr(config, "attn_small_seq_dense", None)
         try:
-            dense_cutoff_val = int(dense_cutoff_hint) if dense_cutoff_hint is not None else max(0, self.seq_low // 2)
+            dense_cutoff_val = int(
+                dense_cutoff_hint) if dense_cutoff_hint is not None else max(0, self.seq_low // 2)
         except (TypeError, ValueError):
             dense_cutoff_val = max(0, self.seq_low // 2)
         if dense_cutoff_val < 0:
@@ -332,7 +380,8 @@ class CausalDynamicAttention(nn.Module):
         self._density_ema: Optional[float] = None
         self._last_density: Optional[float] = None
         self._last_target_k: Optional[int] = None
-        dense_threshold_hint = getattr(config, "attn_force_dense_threshold", None)
+        dense_threshold_hint = getattr(
+            config, "attn_force_dense_threshold", None)
         if dense_threshold_hint is not None:
             dense_threshold = float(dense_threshold_hint)
             if dense_threshold <= 0.0:
@@ -343,14 +392,17 @@ class CausalDynamicAttention(nn.Module):
 
         gates_hint = int(getattr(config, "attn_gates", 0))
         if gates_hint <= 0:
-            gates_hint = max(self.h_total, self.h_active_max, self.h_active) * 2
+            gates_hint = max(self.h_total, self.h_active_max,
+                             self.h_active) * 2
         self.attn_gates = max(gates_hint, self.h_total, self.h_active_max)
         router_noise = float(getattr(config, "attn_router_noise_std", 0.01))
-        self.head_router = SwitchRouter(self.d_model, self.attn_gates, noise_std=router_noise)
+        self.head_router = SwitchRouter(
+            self.d_model, self.attn_gates, noise_std=router_noise)
 
         gate_to_head = self._default_mapping(self.attn_gates, self.h_total)
         self.register_buffer("gate_to_head", gate_to_head, persistent=False)
-        one_hot = F.one_hot(gate_to_head, num_classes=self.h_total).to(torch.float32)
+        one_hot = F.one_hot(
+            gate_to_head, num_classes=self.h_total).to(torch.float32)
         self.register_buffer("gate_to_head_onehot", one_hot, persistent=False)
 
         self._flux_alpha_override: Optional[float] = None
@@ -363,7 +415,8 @@ class CausalDynamicAttention(nn.Module):
         self._mask_cache: Dict[Tuple[str, int, torch.dtype], torch.Tensor] = {}
         self._last_sparse_state: Optional[dict] = None
         self._cached_active_mask: Optional[torch.Tensor] = None
-        self._cached_packing: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = None
+        self._cached_packing: Optional[Tuple[torch.Tensor,
+                                             torch.Tensor, torch.Tensor, int]] = None
         self.last_aux_loss: Optional[torch.Tensor] = None
         self._latency_ema: Optional[float] = None
         self.dna_enabled = bool(getattr(config, "attn_dna_enable", False))
@@ -371,10 +424,13 @@ class CausalDynamicAttention(nn.Module):
         self.dna_threshold = float(getattr(config, "attn_dna_threshold", 0.25))
         self.dna_blend = float(getattr(config, "attn_dna_blend", 0.6))
         self.dna_temp = float(max(getattr(config, "attn_dna_temp", 0.2), 1e-3))
-        self.dna_usage_boost = float(max(getattr(config, "attn_dna_usage_boost", 0.0), 0.0))
-        self.dna_init_scale = float(getattr(config, "attn_dna_init_scale", 0.02))
+        self.dna_usage_boost = float(
+            max(getattr(config, "attn_dna_usage_boost", 0.0), 0.0))
+        self.dna_init_scale = float(
+            getattr(config, "attn_dna_init_scale", 0.02))
         if self.dna_enabled:
-            proto = torch.randn(self.attn_gates, self.d_model, dtype=torch.float32) * self.dna_init_scale
+            proto = torch.randn(self.attn_gates, self.d_model,
+                                dtype=torch.float32) * self.dna_init_scale
             usage = torch.zeros(self.attn_gates, dtype=torch.float32)
             confidence = torch.zeros(self.attn_gates, dtype=torch.float32)
             self.register_buffer("dna_proto", proto)
@@ -383,20 +439,26 @@ class CausalDynamicAttention(nn.Module):
         else:
             self.dna_proto = None  # type: ignore[attr-defined, assignment]
             self.dna_usage_ema = None  # type: ignore[attr-defined, assignment]
-            self.dna_confidence = None  # type: ignore[attr-defined, assignment]
+            # type: ignore[attr-defined, assignment]
+            self.dna_confidence = None
         self._last_dna_stats: Optional[dict] = None
         self.token_sparse = bool(getattr(config, "attn_token_sparse", False))
-        keep_ratio = float(getattr(config, "attn_token_keep_ratio", 1.0) or 1.0)
+        keep_ratio = float(
+            getattr(config, "attn_token_keep_ratio", 1.0) or 1.0)
         keep_ratio = min(max(keep_ratio, 0.0), 1.0)
         self.token_keep_ratio_base = keep_ratio
         self._token_keep_ratio_runtime: Optional[float] = None
-        token_keep_sched = str(getattr(config, "attn_linear_token_keep_schedule", "sqrt") or "sqrt").lower()
+        token_keep_sched = str(
+            getattr(config, "attn_linear_token_keep_schedule", "sqrt") or "sqrt").lower()
         if token_keep_sched not in {"fixed", "sqrt", "log"}:
             token_keep_sched = "sqrt"
         self.linear_token_keep_schedule = token_keep_sched
-        self.linear_token_keep_ratio_min = float(getattr(config, "attn_linear_token_keep_min_ratio", 0.2) or 0.2)
-        self.linear_token_keep_ratio_min = min(max(self.linear_token_keep_ratio_min, 0.0), self.token_keep_ratio_base)
-        self.linear_token_keep_ratio_ref = int(getattr(config, "attn_linear_token_keep_ref", 2048) or 2048)
+        self.linear_token_keep_ratio_min = float(
+            getattr(config, "attn_linear_token_keep_min_ratio", 0.2) or 0.2)
+        self.linear_token_keep_ratio_min = min(
+            max(self.linear_token_keep_ratio_min, 0.0), self.token_keep_ratio_base)
+        self.linear_token_keep_ratio_ref = int(
+            getattr(config, "attn_linear_token_keep_ref", 2048) or 2048)
         min_keep_cfg = int(getattr(config, "attn_token_keep_min", 0) or 0)
         if min_keep_cfg < 0:
             min_keep_cfg = 0
@@ -404,8 +466,10 @@ class CausalDynamicAttention(nn.Module):
         if guard_cfg < 0:
             guard_cfg = 0
         self.token_keep_guard = guard_cfg
-        self.token_keep_min = max(min_keep_cfg, guard_cfg if self.token_sparse else min_keep_cfg)
-        threshold_cfg = float(getattr(config, "attn_token_keep_threshold", 0.0) or 0.0)
+        self.token_keep_min = max(
+            min_keep_cfg, guard_cfg if self.token_sparse else min_keep_cfg)
+        threshold_cfg = float(
+            getattr(config, "attn_token_keep_threshold", 0.0) or 0.0)
         self.token_keep_threshold = float(max(0.0, threshold_cfg))
         self._last_token_importance: Optional[torch.Tensor] = None
         self._last_token_mask: Optional[torch.Tensor] = None
@@ -417,7 +481,8 @@ class CausalDynamicAttention(nn.Module):
     @staticmethod
     def _default_mapping(gates: int, heads: int) -> torch.Tensor:
         """Creates a default mapping from gates to heads."""
-        if heads <= 0: heads = 1
+        if heads <= 0:
+            heads = 1
         idx = torch.arange(gates, dtype=torch.long)
         return torch.clamp((idx * heads) // max(gates, 1), 0, heads - 1)
 
@@ -430,39 +495,47 @@ class CausalDynamicAttention(nn.Module):
         dna_blend_scalar: Optional[torch.Tensor] = None
         if self.dna_enabled and self.dna_proto is not None:
             proto = self.dna_proto
-            token_norm = F.normalize(x.detach().to(torch.float32), dim=-1, eps=1e-6)
+            token_norm = F.normalize(x.detach().to(
+                torch.float32), dim=-1, eps=1e-6)
             proto_norm = F.normalize(proto, dim=-1, eps=1e-6)
             sims = torch.matmul(token_norm, proto_norm.transpose(0, 1))
             dna_similarity, _ = sims.max(dim=-1)
             dna_probs = F.softmax(sims / self.dna_temp, dim=-1)
             blend_scalar = torch.clamp(
-                (dna_similarity - self.dna_threshold) / max(1e-6, 1.0 - self.dna_threshold),
+                (dna_similarity - self.dna_threshold) /
+                max(1e-6, 1.0 - self.dna_threshold),
                 0.0,
                 1.0,
             )
             if self.dna_confidence is not None:
-                confidence = (self.dna_confidence.view(1, 1, -1) + 1e-6).to(torch.float32)
+                confidence = (self.dna_confidence.view(
+                    1, 1, -1) + 1e-6).to(torch.float32)
                 dna_probs = dna_probs * confidence
-                dna_probs = dna_probs / dna_probs.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                dna_probs = dna_probs / \
+                    dna_probs.sum(dim=-1, keepdim=True).clamp_min(1e-6)
             dna_probs = dna_probs.to(gate_probs.dtype)
-            blend = self.dna_blend * blend_scalar.unsqueeze(-1).to(gate_probs.dtype)
+            blend = self.dna_blend * \
+                blend_scalar.unsqueeze(-1).to(gate_probs.dtype)
             gate_probs = gate_probs * (1.0 - blend) + dna_probs * blend
             usage_bias = None
             if self.dna_usage_boost > 0.0 and self.dna_usage_ema is not None:
                 usage = self.dna_usage_ema + 1e-6
                 usage_bias = torch.softmax(-usage, dim=0).to(gate_probs.dtype)
                 gate_probs = gate_probs + usage_bias.view(1, 1, -1) * (
-                    (1.0 - blend_scalar).unsqueeze(-1).to(gate_probs.dtype) * self.dna_usage_boost
+                    (1.0 - blend_scalar).unsqueeze(-1).to(gate_probs.dtype) *
+                    self.dna_usage_boost
                 )
             gate_probs = gate_probs.clamp_min(0.0)
-            gate_probs = gate_probs / gate_probs.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            gate_probs = gate_probs / \
+                gate_probs.sum(dim=-1, keepdim=True).clamp_min(1e-6)
             dna_stats = {
                 "max_sim_mean": float(dna_similarity.mean().item()),
                 "blend_mean": float(blend_scalar.mean().item()),
                 "active_tokens": int((blend_scalar > 0).sum().item()),
             }
             if usage_bias is not None:
-                entropy = -(usage_bias * usage_bias.clamp_min(1e-9).log()).sum()
+                entropy = - \
+                    (usage_bias * usage_bias.clamp_min(1e-9).log()).sum()
                 dna_stats["usage_bias_entropy"] = float(entropy.item())
             dna_blend_scalar = blend_scalar.detach()
         self._last_dna_stats = dna_stats
@@ -506,7 +579,8 @@ class CausalDynamicAttention(nn.Module):
 
     def _causal_mask(self, target_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """Return (and cache) a causal mask of size (target_len, target_len)."""
-        key = (device.type, int(device.index) if device.index is not None else -1, dtype)
+        key = (device.type, int(device.index)
+               if device.index is not None else -1, dtype)
         cached = self._mask_cache.get(key)
         if cached is None or cached.size(0) < target_len or cached.device != device or cached.dtype != dtype:
             mask = _get_causal_mask(target_len, device, dtype)
@@ -525,7 +599,8 @@ class CausalDynamicAttention(nn.Module):
             curve = self.h_active_curve
             if curve != 1.0:
                 ratio = max(0.0, min(1.0, ratio)) ** curve
-            interp = self.h_active_max - ratio * (self.h_active_max - self.h_active_min)
+            interp = self.h_active_max - ratio * \
+                (self.h_active_max - self.h_active_min)
             target = int(math.floor(interp + 1e-6))
         target = max(self.h_active_min, min(target, self.h_active_max))
         self._last_target_k = target
@@ -549,7 +624,8 @@ class CausalDynamicAttention(nn.Module):
         B, T = importance.shape
         if T == 0:
             return None
-        ratio = float(self._token_keep_ratio_runtime if self._token_keep_ratio_runtime is not None else self.token_keep_ratio_base)
+        ratio = float(
+            self._token_keep_ratio_runtime if self._token_keep_ratio_runtime is not None else self.token_keep_ratio_base)
         if ratio >= 0.999 and self.token_keep_threshold <= 0.0:
             mask = torch.ones(B, T, dtype=torch.bool, device=importance.device)
             guard = min(self.token_keep_guard, T)
@@ -561,7 +637,8 @@ class CausalDynamicAttention(nn.Module):
         guard = min(max(0, self.token_keep_guard), T)
         min_keep = min(max(0, self.token_keep_min), T)
         min_keep = max(min_keep, guard)
-        keep_counts = torch.full((B,), ratio * T, device=importance.device, dtype=torch.float32)
+        keep_counts = torch.full(
+            (B,), ratio * T, device=importance.device, dtype=torch.float32)
         keep_counts = keep_counts.round().to(torch.int64)
         if min_keep > 0:
             keep_counts = torch.clamp(keep_counts, min=min_keep)
@@ -579,9 +656,11 @@ class CausalDynamicAttention(nn.Module):
             need = max(need, guard)
             need = min(max(1, need), T)
             if need >= T:
-                base = torch.ones(T, dtype=torch.bool, device=importance.device)
+                base = torch.ones(T, dtype=torch.bool,
+                                  device=importance.device)
             else:
-                topk_idx = torch.topk(importance_fp32[b], k=need, largest=True).indices
+                topk_idx = torch.topk(
+                    importance_fp32[b], k=need, largest=True).indices
                 base[topk_idx] = True
             if guard > 0:
                 base[:guard] = True
@@ -595,7 +674,8 @@ class CausalDynamicAttention(nn.Module):
     def _set_linear_scale(self, value: float) -> None:
         min_scale = self._linear_scale_min
         max_scale = max(min_scale, self.linear_L_scale_max)
-        self._linear_L_scale_runtime = float(min(max(value, min_scale), max_scale))
+        self._linear_L_scale_runtime = float(
+            min(max(value, min_scale), max_scale))
         self._linear_runtime_seq_len = None
 
     def adjust_linear_L_scale(self, factor: float) -> None:
@@ -627,7 +707,8 @@ class CausalDynamicAttention(nn.Module):
             return float(max(0.0, min(1.0, self._flux_alpha_override)))
         seq_len = int(max(1, seq_len))
         low = max(1, int(self.seq_low))
-        high = max(low + 1, int(self.linear_switch_ctx)) if self.linear_switch_ctx > 0 else max(low + 1, seq_len)
+        high = max(low + 1, int(self.linear_switch_ctx)
+                   ) if self.linear_switch_ctx > 0 else max(low + 1, seq_len)
         if seq_len <= low:
             return 0.0
         if seq_len >= high:
@@ -650,11 +731,14 @@ class CausalDynamicAttention(nn.Module):
         elif schedule == "log":
             base_val = coeff * math.log2(float(seq_len) + 1.0)
         elif schedule == "mem_cap" and self.linear_mem_budget_mb:
-            heads_est = max(1, int(getattr(self, "_last_target_k", self.linear_head_k)))
-            batch_est = max(1, int(batch_size) if batch_size is not None else 1)
+            heads_est = max(
+                1, int(getattr(self, "_last_target_k", self.linear_head_k)))
+            batch_est = max(1, int(batch_size)
+                            if batch_size is not None else 1)
             denom = heads_est * batch_est * seq_len * max(1, self.d_head) * 8
             if denom > 0:
-                cap_from_mem = int(self.linear_mem_budget_mb * 1024 * 1024 // denom)
+                cap_from_mem = int(
+                    self.linear_mem_budget_mb * 1024 * 1024 // denom)
             else:
                 cap_from_mem = self.linear_L_max
             base_val = max(1, min(cap_from_mem, self.linear_L_max))
@@ -664,12 +748,14 @@ class CausalDynamicAttention(nn.Module):
         eff = max(self.linear_L_min, min(self.linear_L_max, eff_raw))
         window = min(self.linear_window_base, eff)
 
-        dense_cap = int(min(seq_len, max(self.linear_L_min, self.linear_window_base + seq_len // 32)))
+        dense_cap = int(
+            min(seq_len, max(self.linear_L_min, self.linear_window_base + seq_len // 32)))
         dense_cap = max(self.linear_L_min, min(self.linear_L_max, dense_cap))
         eff = int(alpha * eff + (1.0 - alpha) * dense_cap)
         eff = max(self.linear_L_min, min(self.linear_L_max, eff))
 
-        window_dense = max(1, min(seq_len, max(self.linear_window_base, seq_len // 8)))
+        window_dense = max(
+            1, min(seq_len, max(self.linear_window_base, seq_len // 8)))
         window = int(alpha * window + (1.0 - alpha) * window_dense)
         window = max(1, min(eff, window))
 
@@ -683,9 +769,12 @@ class CausalDynamicAttention(nn.Module):
             self.linear_piece_anchor_frac if self.linear_use_anchors else 0.0,
             self.linear_piece_dna_frac if self.linear_use_dna else 0.0,
         )
-        weight_local = (1.0 - alpha) * dense_weights[0] + alpha * target_weights[0]
-        weight_anchor = (1.0 - alpha) * dense_weights[1] + alpha * target_weights[1]
-        weight_dna = (1.0 - alpha) * dense_weights[2] + alpha * target_weights[2]
+        weight_local = (1.0 - alpha) * \
+            dense_weights[0] + alpha * target_weights[0]
+        weight_anchor = (1.0 - alpha) * \
+            dense_weights[1] + alpha * target_weights[1]
+        weight_dna = (1.0 - alpha) * \
+            dense_weights[2] + alpha * target_weights[2]
         total_weight = weight_local + weight_anchor + weight_dna
         if total_weight <= 0.0:
             weight_local = 1.0
@@ -696,11 +785,16 @@ class CausalDynamicAttention(nn.Module):
         weight_anchor /= total_weight
         weight_dna = max(0.0, 1.0 - weight_local - weight_anchor)
 
-        local_cap = int(round(eff * self.linear_piece_local_frac)) if self.linear_use_local else 0
-        anchor_cap = int(round(eff * self.linear_piece_anchor_frac)) if self.linear_use_anchors else 0
-        dna_cap = int(round(eff * self.linear_piece_dna_frac)) if self.linear_use_dna else 0
-        local_cap = int(round(eff * weight_local)) if self.linear_use_local else 0
-        anchor_cap = int(round(eff * weight_anchor)) if self.linear_use_anchors else 0
+        local_cap = int(round(eff * self.linear_piece_local_frac)
+                        ) if self.linear_use_local else 0
+        anchor_cap = int(round(eff * self.linear_piece_anchor_frac)
+                         ) if self.linear_use_anchors else 0
+        dna_cap = int(round(eff * self.linear_piece_dna_frac)
+                      ) if self.linear_use_dna else 0
+        local_cap = int(round(eff * weight_local)
+                        ) if self.linear_use_local else 0
+        anchor_cap = int(round(eff * weight_anchor)
+                         ) if self.linear_use_anchors else 0
         dna_cap = int(round(eff * weight_dna)) if self.linear_use_dna else 0
         caps = [local_cap, anchor_cap, dna_cap]
         total_caps = sum(caps)
@@ -741,7 +835,8 @@ class CausalDynamicAttention(nn.Module):
         if self._linear_runtime is not None and self._linear_runtime_seq_len == seq_len:
             return self._linear_runtime
         alpha = self._get_flux_alpha(seq_len)
-        params = self._compute_effective_linear_params(seq_len, batch_size, alpha)
+        params = self._compute_effective_linear_params(
+            seq_len, batch_size, alpha)
         eff = params["effective_L"]
         self.linear_L = eff
         self.linear_window = params["window"]
@@ -810,12 +905,15 @@ class CausalDynamicAttention(nn.Module):
         if total_rows == 0:
             return q_heads.new_zeros(q_heads.shape)
 
-        runtime = self._prepare_linear_runtime(seq_len, getattr(self, "_last_batch_size", None))
+        runtime = self._prepare_linear_runtime(
+            seq_len, getattr(self, "_last_batch_size", None))
         eff_L = runtime["effective_L"]
 
         alpha = runtime.get("flux_alpha", self._get_flux_alpha(seq_len))
-        flux_candidates = token_idx.unsqueeze(1).expand(-1, eff_L).to(torch.long).clone()
-        flux_lengths = torch.ones(total_rows, device=token_idx.device, dtype=torch.long)
+        flux_candidates = token_idx.unsqueeze(
+            1).expand(-1, eff_L).to(torch.long).clone()
+        flux_lengths = torch.ones(
+            total_rows, device=token_idx.device, dtype=torch.long)
 
         for head in range(active_heads):
             start = int(row_offsets[head].item())
@@ -864,7 +962,6 @@ class CausalDynamicAttention(nn.Module):
             self.last_head_stats["flux_alpha"] = float(alpha)
         return attn_sparse
 
-
     def _quantize_per_head_int8(self, tensor: torch.Tensor, ema_buffer: str) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Quantize a (H, T, D) tensor to int8 with per-head scales.
@@ -873,7 +970,8 @@ class CausalDynamicAttention(nn.Module):
         dequantized values can be recovered via ``quant * scale``.
         """
         if tensor.dim() != 3:
-            raise ValueError("Expected a rank-3 tensor for per-head quantization")
+            raise ValueError(
+                "Expected a rank-3 tensor for per-head quantization")
         tensor_fp32 = tensor.to(torch.float32)
         flat = tensor_fp32.view(tensor_fp32.size(0), -1)
         abs_flat = flat.abs()
@@ -887,7 +985,8 @@ class CausalDynamicAttention(nn.Module):
                 base_vals = abs_flat.amax(dim=1, keepdim=True)
             else:
                 # torch.quantile expects floating tensors
-                base_vals = torch.quantile(abs_flat, percentile, dim=1, keepdim=True)
+                base_vals = torch.quantile(
+                    abs_flat, percentile, dim=1, keepdim=True)
                 max_vals = abs_flat.amax(dim=1, keepdim=True)
                 base_vals = torch.where(base_vals > 0.0, base_vals, max_vals)
             if mode == "ema_percentile":
@@ -900,15 +999,18 @@ class CausalDynamicAttention(nn.Module):
                 if ema_tensor is None or ema_tensor.numel() != flat.size(0) or not initialized:
                     ema_tensor = abs_flat.amax(dim=1)
                 else:
-                    ema_tensor = ema_tensor.to(tensor.device, dtype=torch.float32)
-                updated = decay * ema_tensor + (1.0 - decay) * base_vals.squeeze(1)
+                    ema_tensor = ema_tensor.to(
+                        tensor.device, dtype=torch.float32)
+                updated = decay * ema_tensor + \
+                    (1.0 - decay) * base_vals.squeeze(1)
                 setattr(self, ema_buffer, updated.detach())
                 if flags is not None:
                     flags[ema_buffer] = True
                 base_vals = updated.unsqueeze(1)
 
         scales = torch.clamp(base_vals / 127.0, min=1e-6)
-        quant = torch.clamp((flat / scales).round(), -127.0, 127.0).to(torch.int8)
+        quant = torch.clamp((flat / scales).round(), -
+                            127.0, 127.0).to(torch.int8)
         quant = quant.view_as(tensor)
         scales = scales.squeeze(1).to(tensor.device, dtype=torch.float32)
         return quant.contiguous(), scales.contiguous()
@@ -919,9 +1021,12 @@ class CausalDynamicAttention(nn.Module):
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=2)
 
-        q = q.view(B, T, self.h_total, self.d_head).permute(0, 2, 1, 3).reshape(B * self.h_total, T, self.d_head)
-        k = k.view(B, T, self.h_total, self.d_head).permute(0, 2, 1, 3).reshape(B * self.h_total, T, self.d_head)
-        v = v.view(B, T, self.h_total, self.d_head).permute(0, 2, 1, 3).reshape(B * self.h_total, T, self.d_head)
+        q = q.view(B, T, self.h_total, self.d_head).permute(
+            0, 2, 1, 3).reshape(B * self.h_total, T, self.d_head)
+        k = k.view(B, T, self.h_total, self.d_head).permute(
+            0, 2, 1, 3).reshape(B * self.h_total, T, self.d_head)
+        v = v.view(B, T, self.h_total, self.d_head).permute(
+            0, 2, 1, 3).reshape(B * self.h_total, T, self.d_head)
 
         dropout_p = self.dropout.p if self.training else 0.0
         attn = F.scaled_dot_product_attention(
@@ -1033,12 +1138,14 @@ class CausalDynamicAttention(nn.Module):
         token_mask = self._select_active_tokens(self._last_token_importance)
         if token_mask is not None and token_mask.shape != (B, T):
             token_mask = None
-        token_keep_fraction = float(token_mask.float().mean().item()) if token_mask is not None else 1.0
+        token_keep_fraction = float(
+            token_mask.float().mean().item()) if token_mask is not None else 1.0
         self._last_token_mask = token_mask
 
         # Aggregate gate probabilities to head probabilities via the mapping
         # This is the same efficient matrix multiplication trick used in DynamicMoE
-        map_mat = self.gate_to_head_onehot.to(dtype=gate_probs.dtype, device=gate_probs.device)
+        map_mat = self.gate_to_head_onehot.to(
+            dtype=gate_probs.dtype, device=gate_probs.device)
         head_probs = torch.matmul(gate_probs, map_mat)  # (B, T, h_total)
         router_reg = None
         reg_terms: list[torch.Tensor] = []
@@ -1047,7 +1154,8 @@ class CausalDynamicAttention(nn.Module):
         if self.router_reg_lambda > 0.0:
             raw_mode = str(self.router_reg_mode or "").lower()
             raw_mode = raw_mode.replace("|", ",").replace("+", ",")
-            mode_parts = {part.strip() for part in raw_mode.split(",") if part.strip()}
+            mode_parts = {part.strip()
+                          for part in raw_mode.split(",") if part.strip()}
             if not mode_parts:
                 mode_parts = {"entropy"}
 
@@ -1076,11 +1184,14 @@ class CausalDynamicAttention(nn.Module):
             topk = max(1, min(topk, self.linear_head_k))
             self._last_target_k = topk
         if topk <= 0:
-            raise RuntimeError("DMoAH requires at least one active head per token")
-        head_scores, top_head_indices = torch.topk(head_probs, topk, dim=-1)  # (B, T, h_active)
+            raise RuntimeError(
+                "DMoAH requires at least one active head per token")
+        head_scores, top_head_indices = torch.topk(
+            head_probs, topk, dim=-1)  # (B, T, h_active)
 
         # Build a mask that marks active heads per token
-        head_mask_bool = torch.zeros(B, T, self.h_total, device=device, dtype=torch.bool)
+        head_mask_bool = torch.zeros(
+            B, T, self.h_total, device=device, dtype=torch.bool)
         head_mask_bool.scatter_(2, top_head_indices, True)
         if token_mask is not None:
             head_mask_bool &= token_mask.unsqueeze(-1)
@@ -1091,7 +1202,8 @@ class CausalDynamicAttention(nn.Module):
         if lb_requested:
             head_mass = head_probs.float().mean(dim=(0, 1))
             assign_fraction = head_mask_bool.float().mean(dim=(0, 1))
-            load_balance_term = self.h_total * torch.sum(head_mass * assign_fraction)
+            load_balance_term = self.h_total * \
+                torch.sum(head_mass * assign_fraction)
             reg_terms.append(load_balance_term)
             self.last_aux_loss = load_balance_term
         if reg_terms:
@@ -1101,11 +1213,13 @@ class CausalDynamicAttention(nn.Module):
             router_reg = self.router_reg_lambda * combined_reg
         total_active_heads = int(active_head_mask.sum().item())
         active_counts = head_mask_per_head.sum(dim=2).float()
-        max_rows_est = int(active_counts.max().item()) if active_counts.numel() > 0 else 0
+        max_rows_est = int(active_counts.max().item()
+                           ) if active_counts.numel() > 0 else 0
         density_est = float(max_rows_est) / float(max(1, T))
         self._update_density(density_est)
         density_threshold = self._density_threshold()
-        all_rows_active = bool(active_mask_flat.all().item()) if active_mask_flat.numel() else False
+        all_rows_active = bool(active_mask_flat.all(
+        ).item()) if active_mask_flat.numel() else False
         force_dense = False
         if density_threshold is not None and density_est >= density_threshold:
             force_dense = True
@@ -1121,9 +1235,12 @@ class CausalDynamicAttention(nn.Module):
         k = k.view(B, T, self.h_total, self.d_head)
         v = v.view(B, T, self.h_total, self.d_head)
 
-        q_flat = q.permute(0, 2, 1, 3).reshape(B * self.h_total, T, self.d_head)
-        k_flat = k.permute(0, 2, 1, 3).reshape(B * self.h_total, T, self.d_head)
-        v_flat = v.permute(0, 2, 1, 3).reshape(B * self.h_total, T, self.d_head)
+        q_flat = q.permute(0, 2, 1, 3).reshape(
+            B * self.h_total, T, self.d_head)
+        k_flat = k.permute(0, 2, 1, 3).reshape(
+            B * self.h_total, T, self.d_head)
+        v_flat = v.permute(0, 2, 1, 3).reshape(
+            B * self.h_total, T, self.d_head)
 
         limit = TRITON_SEQ_LEN_LIMIT
         long_context = limit > 0 and T >= limit
@@ -1147,7 +1264,8 @@ class CausalDynamicAttention(nn.Module):
                 training=self.training,
             )
 
-            attn_out = attn_flat.view(B, self.h_total, T, self.d_head).permute(0, 2, 1, 3)
+            attn_out = attn_flat.view(
+                B, self.h_total, T, self.d_head).permute(0, 2, 1, 3)
             mode_str = "dense" if total_active_heads == B * self.h_total else "dense_auto"
             exec_mode_label = mode_str
             self._last_sparse_state = {
@@ -1163,7 +1281,8 @@ class CausalDynamicAttention(nn.Module):
                 "mode_selected": mode_now,
             }
         else:
-            active_head_indices = active_head_mask.nonzero(as_tuple=False).squeeze(1)
+            active_head_indices = active_head_mask.nonzero(
+                as_tuple=False).squeeze(1)
             if active_head_indices.numel() == 0:
                 attn_out = x.new_zeros(B, T, self.h_total, self.d_head)
                 self._cached_active_mask = None
@@ -1181,8 +1300,10 @@ class CausalDynamicAttention(nn.Module):
                     "mode_selected": mode_now,
                 }
             else:
-                active_mask_comp = active_mask_flat.index_select(0, active_head_indices)
-                active_mask_comp = active_mask_comp.to(dtype=torch.bool, device=device).contiguous()
+                active_mask_comp = active_mask_flat.index_select(
+                    0, active_head_indices)
+                active_mask_comp = active_mask_comp.to(
+                    dtype=torch.bool, device=device).contiguous()
 
                 cache_hit = (
                     (not self.training)
@@ -1214,9 +1335,12 @@ class CausalDynamicAttention(nn.Module):
 
                 if packed is None:
                     attn_sparse = q_comp.new_zeros(q_comp.shape)
-                    attn_out_flat = q_flat.new_zeros(B * self.h_total, T, self.d_head)
-                    attn_out_flat.index_copy_(0, active_head_indices, attn_sparse)
-                    attn_out = attn_out_flat.view(B, self.h_total, T, self.d_head).permute(0, 2, 1, 3)
+                    attn_out_flat = q_flat.new_zeros(
+                        B * self.h_total, T, self.d_head)
+                    attn_out_flat.index_copy_(
+                        0, active_head_indices, attn_sparse)
+                    attn_out = attn_out_flat.view(
+                        B, self.h_total, T, self.d_head).permute(0, 2, 1, 3)
                     self._last_sparse_state = {
                         "mode": "sparse",
                         "backend": get_last_backend(),
@@ -1258,16 +1382,21 @@ class CausalDynamicAttention(nn.Module):
                             self.quantize_sparse_int8 and not self.training and not long_context
                         )
                         if not long_context and causal_mask is None:
-                            causal_mask = self._causal_mask(T, device, q_flat.dtype)
+                            causal_mask = self._causal_mask(
+                                T, device, q_flat.dtype)
                         if use_quant:
-                            q_quant, q_scales = self._quantize_per_head_int8(q_comp, "_quant_ema_q")
-                            k_quant, k_scales = self._quantize_per_head_int8(k_comp, "_quant_ema_k")
-                            v_quant, v_scales = self._quantize_per_head_int8(v_comp, "_quant_ema_v")
+                            q_quant, q_scales = self._quantize_per_head_int8(
+                                q_comp, "_quant_ema_q")
+                            k_quant, k_scales = self._quantize_per_head_int8(
+                                k_comp, "_quant_ema_k")
+                            v_quant, v_scales = self._quantize_per_head_int8(
+                                v_comp, "_quant_ema_v")
                             attn_sparse = dmoah_sparse_attention(
                                 q_quant,
                                 k_quant,
                                 v_quant,
-                                active_mask=active_mask_comp.unsqueeze(-1).contiguous(),
+                                active_mask=active_mask_comp.unsqueeze(
+                                    -1).contiguous(),
                                 causal_mask=causal_mask,
                                 dropout_p=dropout_p,
                                 training=self.training,
@@ -1282,7 +1411,8 @@ class CausalDynamicAttention(nn.Module):
                                 q_comp,
                                 k_comp,
                                 v_comp,
-                                active_mask=active_mask_comp.unsqueeze(-1).contiguous(),
+                                active_mask=active_mask_comp.unsqueeze(
+                                    -1).contiguous(),
                                 causal_mask=causal_mask,
                                 dropout_p=dropout_p,
                                 training=self.training,
@@ -1290,9 +1420,12 @@ class CausalDynamicAttention(nn.Module):
                             )
                         backend_name = get_last_backend()
 
-                    attn_out_flat = q_flat.new_zeros(B * self.h_total, T, self.d_head)
-                    attn_out_flat.index_copy_(0, active_head_indices, attn_sparse)
-                    attn_out = attn_out_flat.view(B, self.h_total, T, self.d_head).permute(0, 2, 1, 3)
+                    attn_out_flat = q_flat.new_zeros(
+                        B * self.h_total, T, self.d_head)
+                    attn_out_flat.index_copy_(
+                        0, active_head_indices, attn_sparse)
+                    attn_out = attn_out_flat.view(
+                        B, self.h_total, T, self.d_head).permute(0, 2, 1, 3)
                     sparse_state = {
                         "mode": mode_label,
                         "backend": backend_name,
@@ -1313,12 +1446,15 @@ class CausalDynamicAttention(nn.Module):
                     if mode_now == "linear":
                         sparse_state["linear_L"] = int(self.linear_L)
                         sparse_state["linear_window"] = int(self.linear_window)
-                        sparse_state["linear_anchor_stride"] = int(self.linear_anchor_stride)
+                        sparse_state["linear_anchor_stride"] = int(
+                            self.linear_anchor_stride)
                         backend_info = self._last_flux_backend_info or get_last_backend_info()
-                        backend_name = backend_info.get("name") if isinstance(backend_info, dict) else None
+                        backend_name = backend_info.get("name") if isinstance(
+                            backend_info, dict) else None
                         if backend_name is not None:
                             sparse_state["linear_shortlist_backend"] = backend_name
-                            details = backend_info.get("details") if isinstance(backend_info, dict) else None
+                            details = backend_info.get("details") if isinstance(
+                                backend_info, dict) else None
                             if isinstance(details, dict):
                                 for key, value in details.items():
                                     sparse_state[f"linear_shortlist_{key}"] = value
@@ -1342,7 +1478,8 @@ class CausalDynamicAttention(nn.Module):
             head_scores_fp32 = torch.zeros_like(mask_bt_h, dtype=torch.float32)
             head_scores_fp32.scatter_(2, top_head_indices, head_scores.float())
             gate_probs_fp32 = gate_probs.float()
-            entropy = -(gate_probs_fp32.clamp_min(1e-9).log() * gate_probs_fp32).sum(dim=-1).mean()
+            entropy = -(gate_probs_fp32.clamp_min(1e-9).log()
+                        * gate_probs_fp32).sum(dim=-1).mean()
             active_fraction = mask_bt_h.float().mean()
             active_per_token = mask_bt_h.sum(dim=2).float().mean()
             unique_heads = mask_bt_h.any(dim=0).any(dim=0).sum()
@@ -1369,12 +1506,15 @@ class CausalDynamicAttention(nn.Module):
         if mode_now == "linear":
             self.last_head_stats["linear_L"] = int(self.linear_L)
             self.last_head_stats["linear_window"] = int(self.linear_window)
-            self.last_head_stats["linear_anchor_stride"] = int(self.linear_anchor_stride)
+            self.last_head_stats["linear_anchor_stride"] = int(
+                self.linear_anchor_stride)
             backend_info = self._last_flux_backend_info or get_last_backend_info()
-            backend_name = backend_info.get("name") if isinstance(backend_info, dict) else None
+            backend_name = backend_info.get("name") if isinstance(
+                backend_info, dict) else None
             if backend_name is not None:
                 self.last_head_stats["linear_shortlist_backend"] = backend_name
-                details = backend_info.get("details") if isinstance(backend_info, dict) else None
+                details = backend_info.get("details") if isinstance(
+                    backend_info, dict) else None
                 if isinstance(details, dict):
                     for key, value in details.items():
                         self.last_head_stats[f"linear_shortlist_{key}"] = value
@@ -1416,6 +1556,7 @@ class AttentionBlock(nn.Module):
     The new Transformer block that uses CausalDynamicAttention.
     This is a drop-in replacement for the original `Block`.
     """
+
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.ln1 = _build_norm(config)

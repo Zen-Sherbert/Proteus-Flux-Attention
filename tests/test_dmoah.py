@@ -6,9 +6,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import protean_forge.kernels.sparse_attn as sparse_attn
-from protean_forge.kernels.sparse_attn import build_flux_candidates, dmoah_sparse_attention
-from protean_forge.models.dmoah import (
+import proteus_attention.kernels.sparse_attn as sparse_attn
+from proteus_attention.kernels.sparse_attn import build_flux_candidates, dmoah_sparse_attention
+from proteus_attention.models.dmoah import (
     AttentionBlock,
     CausalDynamicAttention,
     ModelConfig,
@@ -702,6 +702,8 @@ def test_dmoah_sparse_attention_triton_gpu_matches_cpu():
         dropout_p=0.0,
         training=False,
         causal_mask=causal_mask,
+        flux_candidates=None,
+        flux_lengths=None,
     )
 
     out_gpu = dmoah_sparse_attention(

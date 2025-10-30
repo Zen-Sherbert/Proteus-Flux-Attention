@@ -1,6 +1,6 @@
 import torch
 
-from protean_forge.kernels import tinytoy
+from proteus_attention.kernels import tinytoy
 
 
 def test_build_sequence_lengths_cpu_respects_cap():

@@ -1,9 +1,9 @@
 """
-Protean Forge package: Genetic Attention reference implementation powered by
+Proteus Attention package: Genetic Attention reference implementation powered by
 the Dynamic Mixture-of-Attention-Heads (DMoAH) architecture.
 
 This module exposes the primary building blocks so downstream projects can
-install ``protean-forge`` and import Genetic Attention kernels or models
+install ``proteus-attention`` and import Genetic Attention kernels or models
 directly while still accessing the DMoAH internals when needed.
 """
 

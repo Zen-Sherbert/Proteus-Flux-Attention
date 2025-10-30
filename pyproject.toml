@@ -3,13 +3,14 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "protean-forge"
+name = "proteus-attention"
 version = "0.1.0"
 description = "Genetic Attention modules powered by the Dynamic Mixture-of-Attention-Heads (DMoAH) architecture."
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "Protean Forge Contributors" }]
-keywords = ["attention", "sparse-attention", "flux", "triton", "deep-learning"]
+authors = [{ name = "Scott Dietz" }]
+keywords = ["attention", "sparse-attention", "proteus", "flux", "triton", "deep-learning"]
+license = "Apache-2.0"
 dependencies = [
     "torch>=2.1",
 ]
@@ -20,7 +21,6 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Intended Audience :: Science/Research",
-    "License :: Other/Proprietary License",
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -28,7 +28,7 @@ classifiers = [
 [project.optional-dependencies]
 gpu = ["triton>=2.1"]
 dev = ["pytest>=7"]
-examples = ["matplotlib>=3.7"]
+examples = ["matplotlib>=3.7", "tiktoken>=0.5"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

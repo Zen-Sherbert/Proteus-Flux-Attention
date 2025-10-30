@@ -1,8 +1,8 @@
 """
-Model components for the Protean Forge package.
+Model components for the Proteus Attention package.
 
 Re-export key transformer components so that consumers can import from
-`protean_forge.models` without diving into implementation files.
+`proteus_attention.models` without diving into implementation files.
 """
 
 from .dmoah import (

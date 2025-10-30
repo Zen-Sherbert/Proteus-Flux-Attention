@@ -1,4 +1,4 @@
-"""Kernel utilities for the Protean Forge package."""
+"""Kernel utilities for the Proteus Attention package."""
 
 from .sparse_attn import build_flux_candidates, dmoah_sparse_attention, get_last_backend, get_last_backend_info
 
