@@ -74,7 +74,7 @@ There are training examples, in the examples folder.
 ## Installation
 
 ```bash
-pip install proteus-attention
+pip install -e .
 ```
 
 ## Quick Start: A Complete Example
