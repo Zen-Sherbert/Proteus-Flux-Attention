@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import math
 import time
+import warnings
+from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -20,6 +22,7 @@ from ..kernels.sparse_attn import (
     get_last_backend,
     get_last_backend_info,
     build_flux_candidates,
+    build_packed_flux_candidates,
     _record_backend,
     _pack_active_rows,
     TRITON_SEQ_LEN_LIMIT,
@@ -53,6 +56,8 @@ class ModelConfig:
         "attn_linear_switch_ctx": 20000,
         "attn_linear_latency_budget_ms": None,
         "attn_linear_policy": "local+anchors",
+        "attn_use_rope": True,
+        "attn_rope_base": 10000.0,
     }
 
     def __init__(self, **kwargs: Any) -> None:
@@ -217,6 +222,25 @@ class CausalDynamicAttention(nn.Module):
 
         # The dimension of each individual head.
         self.d_head = self.d_model // self.h_total
+
+        self.use_rope = bool(getattr(config, "attn_use_rope", True))
+        rope_base = float(getattr(config, "attn_rope_base", 10000.0) or 10000.0)
+        if rope_base <= 0.0:
+            rope_base = 10000.0
+        self.rope_base = rope_base
+        if self.use_rope and (self.d_head % 2 != 0):
+            warnings.warn(
+                "Disabling RoPE because attention head dimension is not even.",
+                RuntimeWarning,
+            )
+            self.use_rope = False
+        inv_freq = 1.0 / (
+            self.rope_base ** (
+                torch.arange(0, self.d_head, 2, dtype=torch.float32) / max(self.d_head, 1)
+            )
+        )
+        self.register_buffer("_rope_inv_freq", inv_freq, persistent=False)
+        self._rope_cache: Dict[Tuple[str, int, str], Tuple[int, torch.Tensor, torch.Tensor]] = {}
 
         self.dropout = nn.Dropout(config.p_dropout)
         self.use_sdpa = bool(getattr(config, "use_sdpa", True) and hasattr(
@@ -419,6 +443,8 @@ class CausalDynamicAttention(nn.Module):
                                              torch.Tensor, torch.Tensor, int]] = None
         self.last_aux_loss: Optional[torch.Tensor] = None
         self._latency_ema: Optional[float] = None
+        self.track_latency: bool = bool(
+            getattr(config, "attn_track_latency", True))
         self.dna_enabled = bool(getattr(config, "attn_dna_enable", False))
         self.dna_decay = float(getattr(config, "attn_dna_decay", 0.97))
         self.dna_threshold = float(getattr(config, "attn_dna_threshold", 0.25))
@@ -479,6 +505,57 @@ class CausalDynamicAttention(nn.Module):
         self._last_batch_size: Optional[int] = None
 
     @staticmethod
+    def _rope_rotate_half(x: torch.Tensor) -> torch.Tensor:
+        """Swap even/odd components as part of rotary embedding application."""
+        x_even = x[..., ::2]
+        x_odd = x[..., 1::2]
+        return torch.stack((-x_odd, x_even), dim=-1).reshape_as(x)
+
+    def _rope_factors(
+        self, seq_len: int, device: torch.device, dtype: torch.dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return cached (cos, sin) factors for rotary embeddings."""
+        if seq_len <= 0:
+            raise ValueError("RoPE requires a positive sequence length.")
+        cache_key = (
+            device.type,
+            int(device.index) if device.index is not None else -1,
+            str(dtype),
+        )
+        cached = self._rope_cache.get(cache_key)
+        needs_update = cached is None or cached[0] < seq_len
+        if needs_update:
+            inv_freq = self._rope_inv_freq
+            if inv_freq.device != device:
+                inv_freq = inv_freq.to(device=device)
+            t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
+            freqs = torch.outer(t, inv_freq)
+            cos = freqs.cos()
+            sin = freqs.sin()
+            cos = torch.repeat_interleave(cos, 2, dim=-1)
+            sin = torch.repeat_interleave(sin, 2, dim=-1)
+            cos = cos.to(dtype=dtype)
+            sin = sin.to(dtype=dtype)
+            cached = (seq_len, cos, sin)
+            self._rope_cache[cache_key] = cached
+        _, cos_cached, sin_cached = cached
+        return cos_cached[:seq_len], sin_cached[:seq_len]
+
+    def _apply_rope_embedding(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply rotary embeddings to query/key tensors with shape (B, T, H, D)."""
+        if not self.use_rope:
+            return q, k
+        seq_len = q.size(1)
+        cos, sin = self._rope_factors(seq_len, q.device, q.dtype)
+        cos = cos.view(1, seq_len, 1, self.d_head)
+        sin = sin.view(1, seq_len, 1, self.d_head)
+        q = (q * cos) + (self._rope_rotate_half(q) * sin)
+        k = (k * cos) + (self._rope_rotate_half(k) * sin)
+        return q, k
+
+    @staticmethod
     def _default_mapping(gates: int, heads: int) -> torch.Tensor:
         """Creates a default mapping from gates to heads."""
         if heads <= 0:
@@ -497,7 +574,8 @@ class CausalDynamicAttention(nn.Module):
             proto = self.dna_proto
             token_norm = F.normalize(x.detach().to(
                 torch.float32), dim=-1, eps=1e-6)
-            proto_norm = F.normalize(proto, dim=-1, eps=1e-6)
+            proto_norm = F.normalize(
+                proto.to(token_norm.dtype), dim=-1, eps=1e-6)
             sims = torch.matmul(token_norm, proto_norm.transpose(0, 1))
             dna_similarity, _ = sims.max(dim=-1)
             dna_probs = F.softmax(sims / self.dna_temp, dim=-1)
@@ -562,11 +640,11 @@ class CausalDynamicAttention(nn.Module):
             if not mask.any():
                 return
             weighted = flat_probs.transpose(0, 1) @ flat_feats
-            mean = torch.zeros_like(self.dna_proto)
+            mean = torch.zeros_like(self.dna_proto, dtype=flat_feats.dtype)
             mean[mask] = weighted[mask] / counts[mask].unsqueeze(-1)
             decay = self.dna_decay
             proto = self.dna_proto
-            proto[mask] = proto[mask] * decay + mean[mask] * (1.0 - decay)
+            proto[mask] = proto[mask] * decay + mean[mask].to(proto.dtype) * (1.0 - decay)
             usage = self.dna_usage_ema
             usage.mul_(decay)
             usage[mask] += counts[mask] * (1.0 - decay)
@@ -910,37 +988,38 @@ class CausalDynamicAttention(nn.Module):
         eff_L = runtime["effective_L"]
 
         alpha = runtime.get("flux_alpha", self._get_flux_alpha(seq_len))
-        flux_candidates = token_idx.unsqueeze(
-            1).expand(-1, eff_L).to(torch.long).clone()
-        flux_lengths = torch.ones(
-            total_rows, device=token_idx.device, dtype=torch.long)
-
-        for head in range(active_heads):
-            start = int(row_offsets[head].item())
-            end = int(row_offsets[head + 1].item())
-            if start == end:
-                continue
-            rows = token_idx[start:end]
-            global_head = int(head_indices[head].item())
-            batch_index = global_head // self.h_total
-            dna_scores = None
-            if self.linear_use_dna and self._last_token_similarity is not None:
-                dna_scores = self._last_token_similarity[batch_index]
-            candidates, lengths = build_flux_candidates(
-                rows,
-                seq_len,
-                max_candidates=eff_L,
-                linear_window=runtime["window"],
-                anchor_stride=runtime["anchor_stride"],
-                use_local=self.linear_use_local,
-                use_anchors=self.linear_use_anchors,
-                dna_scores=dna_scores,
-                local_cap=runtime["local_cap"],
-                anchor_cap=runtime["anchor_cap"],
-                dna_cap=runtime["dna_cap"],
+        row_batch_ids: Optional[torch.Tensor]
+        dna_scores_all: Optional[torch.Tensor]
+        if self.linear_use_dna and self._last_token_similarity is not None:
+            row_counts = (row_offsets[1:] - row_offsets[:-1]).to(torch.long)
+            head_range = torch.arange(
+                active_heads, device=row_offsets.device, dtype=torch.long
             )
-            flux_candidates[start:end] = candidates.to(torch.long)
-            flux_lengths[start:end] = lengths.to(torch.long)
+            row_head_ids = torch.repeat_interleave(head_range, row_counts)
+            row_head_ids = row_head_ids.to(head_indices.device)
+            global_heads = head_indices[row_head_ids]
+            row_batch_ids = (global_heads // self.h_total).to(
+                device=token_idx.device, dtype=torch.long
+            )
+            dna_scores_all = self._last_token_similarity
+        else:
+            row_batch_ids = None
+            dna_scores_all = None
+
+        flux_candidates, flux_lengths = build_packed_flux_candidates(
+            token_idx,
+            row_batch_ids,
+            seq_len,
+            max_candidates=eff_L,
+            linear_window=runtime["window"],
+            anchor_stride=runtime["anchor_stride"],
+            use_local=self.linear_use_local,
+            use_anchors=self.linear_use_anchors,
+            dna_scores=dna_scores_all,
+            local_cap=runtime["local_cap"],
+            anchor_cap=runtime["anchor_cap"],
+            dna_cap=runtime["dna_cap"],
+        )
 
         self._last_flux_backend_info = None
         attn_sparse = dmoah_sparse_attention(
@@ -1018,27 +1097,40 @@ class CausalDynamicAttention(nn.Module):
     def _forward_dense_fastpath(self, x: torch.Tensor) -> torch.Tensor:
         """Dense SDPA path for very short sequences."""
         B, T, C = x.shape
+        device = x.device
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=2)
 
-        q = q.view(B, T, self.h_total, self.d_head).permute(
-            0, 2, 1, 3).reshape(B * self.h_total, T, self.d_head)
-        k = k.view(B, T, self.h_total, self.d_head).permute(
-            0, 2, 1, 3).reshape(B * self.h_total, T, self.d_head)
-        v = v.view(B, T, self.h_total, self.d_head).permute(
-            0, 2, 1, 3).reshape(B * self.h_total, T, self.d_head)
+        q = q.view(B, T, self.h_total, self.d_head)
+        k = k.view(B, T, self.h_total, self.d_head)
+        v = v.view(B, T, self.h_total, self.d_head)
+
+        if self.use_rope:
+            q, k = self._apply_rope_embedding(q, k)
+
+        q_heads = q.permute(0, 2, 1, 3).contiguous()
+        k_heads = k.permute(0, 2, 1, 3).contiguous()
+        v_heads = v.permute(0, 2, 1, 3).contiguous()
 
         dropout_p = self.dropout.p if self.training else 0.0
-        attn = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            dropout_p=dropout_p,
-            is_causal=True,
+        sdp_ctx = (
+            torch.backends.cuda.sdp_kernel(
+                enable_flash=True, enable_math=False, enable_mem_efficient=True
+            )
+            if device.type == "cuda"
+            else nullcontext()
         )
+        with sdp_ctx:
+            attn = F.scaled_dot_product_attention(
+                q_heads,
+                k_heads,
+                v_heads,
+                attn_mask=None,
+                dropout_p=dropout_p,
+                is_causal=True,
+            )
 
-        attn = attn.view(B, self.h_total, T, self.d_head).permute(0, 2, 1, 3)
+        attn = attn.permute(0, 2, 1, 3)
         y = attn.reshape(B, T, C)
         y = self.proj(y)
         y = self.dropout(y)
@@ -1086,25 +1178,51 @@ class CausalDynamicAttention(nn.Module):
         if not self.dna_enabled:
             self._last_token_similarity = None
 
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        start_time = time.perf_counter()
-
-        def _finalize_latency(mode_label: str) -> float:
+        start_time: Optional[float] = None
+        latency_start_event: Optional[torch.cuda.Event] = None
+        latency_end_event: Optional[torch.cuda.Event] = None
+        if self.track_latency:
             if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            latency_ms = (time.perf_counter() - start_time) * 1000.0
-            if self._latency_ema is None:
-                self._latency_ema = latency_ms
+                latency_start_event = torch.cuda.Event(enable_timing=True)
+                latency_end_event = torch.cuda.Event(enable_timing=True)
+                latency_start_event.record()
             else:
-                self._latency_ema = 0.8 * self._latency_ema + 0.2 * latency_ms
-            if self.last_head_stats is not None:
-                self.last_head_stats["latency_ms"] = float(latency_ms)
-                self.last_head_stats["mode_setting"] = self.mode_setting
-                self.last_head_stats["mode_selected"] = mode_label
-            if self._last_sparse_state is not None:
-                self._last_sparse_state["latency_ms"] = float(latency_ms)
-                self._last_sparse_state["mode_selected"] = mode_label
+                start_time = time.perf_counter()
+
+        def _finalize_latency(mode_label: str) -> Optional[float]:
+            latency_ms: Optional[float] = None
+            if self.track_latency:
+                if device.type == "cuda":
+                    if latency_start_event is None or latency_end_event is None:
+                        raise RuntimeError(
+                            "Latency events were not initialized for CUDA timing.")
+                    latency_end_event.record()
+                    latency_end_event.synchronize()
+                    latency_ms = float(
+                        latency_start_event.elapsed_time(latency_end_event))
+                else:
+                    if start_time is None:
+                        raise RuntimeError(
+                            "Latency timer was not initialized for CPU timing.")
+                    latency_ms = (time.perf_counter() - start_time) * 1000.0
+                if self._latency_ema is None:
+                    self._latency_ema = latency_ms
+                else:
+                    self._latency_ema = 0.8 * \
+                        self._latency_ema + 0.2 * latency_ms
+                if self.last_head_stats is not None:
+                    self.last_head_stats["latency_ms"] = float(latency_ms)
+                    self.last_head_stats["mode_setting"] = self.mode_setting
+                    self.last_head_stats["mode_selected"] = mode_label
+                if self._last_sparse_state is not None:
+                    self._last_sparse_state["latency_ms"] = float(latency_ms)
+                    self._last_sparse_state["mode_selected"] = mode_label
+            else:
+                if self.last_head_stats is not None:
+                    self.last_head_stats["mode_setting"] = self.mode_setting
+                    self.last_head_stats["mode_selected"] = mode_label
+                if self._last_sparse_state is not None:
+                    self._last_sparse_state["mode_selected"] = mode_label
             return latency_ms
 
         self._last_batch_size = B
@@ -1234,6 +1352,9 @@ class CausalDynamicAttention(nn.Module):
         q = q.view(B, T, self.h_total, self.d_head)
         k = k.view(B, T, self.h_total, self.d_head)
         v = v.view(B, T, self.h_total, self.d_head)
+
+        if self.use_rope:
+            q, k = self._apply_rope_embedding(q, k)
 
         q_flat = q.permute(0, 2, 1, 3).reshape(
             B * self.h_total, T, self.d_head)

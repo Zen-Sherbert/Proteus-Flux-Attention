@@ -40,7 +40,7 @@ class TikTokenWrapper:
         self.n_vocab = int(getattr(_ENCODER, "n_vocab", 50257))
 
     def encode(self, text: str) -> List[int]:
-        return _ENCODER.encode(text)  # type: ignore[operator]
+        return _ENCODER.encode(text, disallowed_special=())  # type: ignore[operator]
 
     def decode(self, tokens: Sequence[int]) -> str:
         return _ENCODER.decode(tokens)  # type: ignore[operator]
@@ -54,6 +54,26 @@ def get_tokenizer() -> TikTokenWrapper | ByteFallbackTokenizer:
 
 def load_corpus(path: Optional[Path] = None) -> str:
     target = path or _DEFAULT_DATA
+    if target.is_dir():
+        import random
+
+        candidates = sorted(target.glob("**/*.txt"))
+        if not candidates:
+            return ""
+        random.shuffle(candidates)
+        pieces: list[str] = []
+        limit_chars = 64 * 1024 * 1024  # ~64MB cap to avoid runaway allocations
+        total = 0
+        for candidate in candidates:
+            try:
+                chunk = candidate.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            pieces.append(chunk)
+            total += len(chunk)
+            if total >= limit_chars:
+                break
+        return "\n".join(pieces)
     if not target.is_file():
         return (
             "In the beginning there was Proteus Attention. "

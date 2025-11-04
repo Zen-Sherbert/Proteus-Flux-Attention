@@ -1,0 +1,122 @@
+--- Starting Attention Benchmark ---
+Device: cuda
+Sequence lengths: [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152]
+
+[Probe] DMoAH testing seq_len=128 batch=4 runs=3
+[Probe] DMoAH testing seq_len=256 batch=4 runs=3
+[Probe] DMoAH testing seq_len=512 batch=4 runs=3
+[Probe] DMoAH testing seq_len=1024 batch=4 runs=3
+[Probe] DMoAH testing seq_len=2048 batch=4 runs=3
+[Probe] DMoAH testing seq_len=4096 batch=4 runs=3
+[Probe] DMoAH testing seq_len=8192 batch=1 runs=1
+[Probe] DMoAH testing seq_len=16384 batch=1 runs=1
+[Probe] DMoAH testing seq_len=32768 batch=1 runs=1
+[Probe] DMoAH testing seq_len=65536 batch=1 runs=1
+[Probe] DMoAH testing seq_len=131072 batch=1 runs=1
+[Probe] DMoAH testing seq_len=262144 batch=1 runs=1
+[Probe] DMoAH testing seq_len=524288 batch=1 runs=1
+[Probe] DMoAH testing seq_len=1048576 batch=1 runs=1
+[Probe] DMoAH failed at sequence length 1048576: HIP out of memory. Tried to allocate 1024.00 MiB. GPU 0 has a total capacity of 15.98 GiB of which 336.00 MiB is free. Of the allocated memory 13.59 GiB is allocated by PyTorch, and 1.58 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[Probe] DMoAH safe up to sequence length 524288 on this device.
+Seq Len    | Model                    | Latency (ms)    | Seq/s        | Tok/s           | Memory (MB)     | Active K   | Tokens     | Mode       | Backend                             
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+[Warmup] Priming flux kernel at seq_len=8192...
+[Notice] Standard attention hit its limit at seq_len=128 (last safe ~<unknown>).
+128        | Standard Attention       | OOM             | -            | -               | -               | -          | -          | -          | std-limit                           
+128        | DMoAH (BF16)             | 2.61            | 1529.91      | 195829.02       | 42.18           | 4          | 1.00       | dense      | triton (max_rows=128, density=0.22, unique=32, tokens=1.00, dna_blend=0.00, alpha=0.00)
+[AutoLog] captured DMoAH (BF16) seq_len=128 backend=triton
+128        | DMoAH (INT8)             | 2.44            | 1641.87      | 210159.35       | 42.18           | 4          | 1.00       | dense      | triton (max_rows=128, density=0.21, unique=32, tokens=1.00, dna_blend=0.00, alpha=0.00)
+[AutoLog] captured DMoAH (INT8) seq_len=128 backend=triton
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+256        | Standard Attention       | OOM             | -            | -               | -               | -          | -          | -          | std-limit                           
+256        | DMoAH (BF16)             | 2.59            | 1547.24      | 396094.56       | 54.22           | 4          | 1.00       | sparse     | triton (max_rows=51, density=0.20, unique=32, tokens=1.00, dna_blend=0.00, alpha=0.00)
+[AutoLog] captured DMoAH (BF16) seq_len=256 backend=triton
+256        | DMoAH (INT8)             | 2.72            | 1469.18      | 376109.74       | 57.04           | 4          | 1.00       | sparse     | triton (max_rows=47, density=0.18, unique=32, int8, tokens=1.00, dna_blend=0.00, alpha=0.00)
+[AutoLog] captured DMoAH (INT8) seq_len=256 backend=triton
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+512        | Standard Attention       | OOM             | -            | -               | -               | -          | -          | -          | std-limit                           
+512        | DMoAH (BF16)             | 3.57            | 1120.14      | 573513.27       | 74.86           | 3          | 0.80       | sparse     | triton (max_rows=59, density=0.12, unique=32, tokens=0.80, dna_blend=0.00, alpha=0.03)
+[AutoLog] captured DMoAH (BF16) seq_len=512 backend=triton
+512        | DMoAH (INT8)             | 3.86            | 1035.74      | 530296.65       | 80.99           | 3          | 0.80       | sparse     | triton (max_rows=52, density=0.10, unique=32, int8, tokens=0.80, dna_blend=0.00, alpha=0.03)
+[AutoLog] captured DMoAH (INT8) seq_len=512 backend=triton
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+1024       | Standard Attention       | OOM             | -            | -               | -               | -          | -          | -          | std-limit                           
+1024       | DMoAH (BF16)             | 4.65            | 860.10       | 880744.70       | 116.13          | 3          | 0.74       | sparse     | triton (max_rows=89, density=0.09, unique=32, tokens=0.74, dna_blend=0.00, alpha=0.10)
+[AutoLog] captured DMoAH (BF16) seq_len=1024 backend=triton
+1024       | DMoAH (INT8)             | 5.14            | 777.75       | 796417.95       | 128.75          | 3          | 0.74       | sparse     | triton (max_rows=92, density=0.09, unique=32, int8, tokens=0.74, dna_blend=0.00, alpha=0.10)
+[AutoLog] captured DMoAH (INT8) seq_len=1024 backend=triton
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+2048       | Standard Attention       | OOM             | -            | -               | -               | -          | -          | -          | std-limit                           
+2048       | DMoAH (BF16)             | 5.58            | 716.52       | 1467424.64      | 200.66          | 1          | 0.21       | sparse     | triton (max_rows=22, density=0.01, unique=32, tokens=0.21, dna_blend=0.00, alpha=0.23)
+[AutoLog] captured DMoAH (BF16) seq_len=2048 backend=triton
+2048       | DMoAH (INT8)             | 6.59            | 606.66       | 1242442.56      | 226.61          | 1          | 0.21       | sparse     | triton (max_rows=21, density=0.01, unique=32, int8, tokens=0.21, dna_blend=0.00, alpha=0.23)
+[AutoLog] captured DMoAH (INT8) seq_len=2048 backend=triton
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+4096       | Standard Attention       | OOM             | -            | -               | -               | -          | -          | -          | std-limit                           
+4096       | DMoAH (BF16)             | 8.86            | 451.67       | 1850039.75      | 381.91          | 1          | 0.16       | sparse     | triton (max_rows=34, density=0.01, unique=32, tokens=0.16, dna_blend=0.00, alpha=0.48)
+[AutoLog] captured DMoAH (BF16) seq_len=4096 backend=triton
+4096       | DMoAH (INT8)             | 11.00           | 363.73       | 1489846.36      | 434.99          | 1          | 0.16       | sparse     | triton (max_rows=39, density=0.01, unique=32, int8, tokens=0.16, dna_blend=0.00, alpha=0.48)
+[AutoLog] captured DMoAH (INT8) seq_len=4096 backend=triton
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+8192       | Standard Attention       | OOM             | -            | -               | -               | -          | -          | -          | std-limit                           
+8192       | DMoAH (BF16)             | 6.38            | 156.76       | 1284171.35      | 192.67          | 1          | 0.11       | flux       | triton (max_rows=42, density=0.01, unique=32, tokens=0.11, dna_blend=0.00, alpha=1.00)
+[AutoLog] captured DMoAH (BF16) seq_len=8192 backend=triton
+8192       | DMoAH (INT8)             | 6.39            | 156.42       | 1281379.48      | 192.65          | 1          | 0.11       | flux       | triton (max_rows=40, density=0.00, unique=32, tokens=0.11, dna_blend=0.00, alpha=1.00)
+[AutoLog] captured DMoAH (INT8) seq_len=8192 backend=triton
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+16384      | Standard Attention       | OOM             | -            | -               | -               | -          | -          | -          | std-limit                           
+16384      | DMoAH (BF16)             | 8.68            | 115.16       | 1886814.05      | 326.12          | 1          | 0.04       | flux       | triton (max_rows=38, density=0.00, unique=32, tokens=0.04, dna_blend=0.00, alpha=1.00)
+[AutoLog] captured DMoAH (BF16) seq_len=16384 backend=triton
+16384      | DMoAH (INT8)             | 8.57            | 116.64       | 1911015.10      | 326.12          | 1          | 0.04       | flux       | triton (max_rows=32, density=0.00, unique=32, tokens=0.04, dna_blend=0.00, alpha=1.00)
+[AutoLog] captured DMoAH (INT8) seq_len=16384 backend=triton
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+32768      | Standard Attention       | OOM             | -            | -               | -               | -          | -          | -          | std-limit                           
+32768      | DMoAH (BF16)             | 14.77           | 67.71        | 2218694.68      | 593.08          | 1          | 0.02       | flux       | triton (max_rows=36, density=0.00, unique=32, tokens=0.02, dna_blend=0.00, alpha=1.00)
+[AutoLog] captured DMoAH (BF16) seq_len=32768 backend=triton
+32768      | DMoAH (INT8)             | 14.94           | 66.91        | 2192625.59      | 593.08          | 1          | 0.02       | flux       | triton (max_rows=32, density=0.00, unique=32, tokens=0.02, dna_blend=0.00, alpha=1.00)
+[AutoLog] captured DMoAH (INT8) seq_len=32768 backend=triton
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+65536      | Standard Attention       | OOM             | -            | -               | -               | -          | -          | -          | std-limit                           
+65536      | DMoAH (BF16)             | 27.62           | 36.20        | 2372727.82      | 1127.01         | 1          | 0.02       | flux       | triton (max_rows=73, density=0.00, unique=32, tokens=0.02, dna_blend=0.00, alpha=1.00)
+[AutoLog] captured DMoAH (BF16) seq_len=65536 backend=triton
+65536      | DMoAH (INT8)             | 31.07           | 32.18        | 2109120.16      | 1127.02         | 1          | 0.02       | flux       | triton (max_rows=65, density=0.00, unique=32, tokens=0.02, dna_blend=0.00, alpha=1.00)
+[AutoLog] captured DMoAH (INT8) seq_len=65536 backend=triton
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+131072     | Standard Attention       | OOM             | -            | -               | -               | -          | -          | -          | std-limit                           
+131072     | DMoAH (BF16)             | 516.92          | 1.93         | 253562.61       | 2194.89         | 1          | 0.02       | flux       | triton (max_rows=339, density=0.00, unique=32, tokens=0.02, dna_blend=0.00, alpha=1.00)
+[AutoLog] captured DMoAH (BF16) seq_len=131072 backend=triton
+131072     | DMoAH (INT8)             | 219.85          | 4.55         | 596186.10       | 2194.91         | 1          | 0.02       | flux       | triton (max_rows=215, density=0.00, unique=32, tokens=0.02, dna_blend=0.00, alpha=1.00)
+[AutoLog] captured DMoAH (INT8) seq_len=131072 backend=triton
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+262144     | Standard Attention       | OOM             | -            | -               | -               | -          | -          | -          | std-limit                           
+262144     | DMoAH (BF16)             | 1552.17         | 0.64         | 168888.57       | 4330.67         | 1          | 0.03       | flux       | triton (max_rows=1702, density=0.01, unique=32, tokens=0.03, dna_blend=0.00, alpha=1.00)
+[AutoLog] captured DMoAH (BF16) seq_len=262144 backend=triton
+262144     | DMoAH (INT8)             | 359.38          | 2.78         | 729436.38       | 4330.73         | 1          | 0.03       | flux       | triton (max_rows=1682, density=0.01, unique=32, tokens=0.03, dna_blend=0.00, alpha=1.00)
+[AutoLog] captured DMoAH (INT8) seq_len=262144 backend=triton
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+524288     | Standard Attention       | OOM             | -            | -               | -               | -          | -          | -          | std-limit                           
+524288     | DMoAH (BF16)             | 2445.16         | 0.41         | 214418.92       | 8602.09         | 1          | 0.02       | flux       | triton (max_rows=1128, density=0.00, unique=32, tokens=0.02, dna_blend=0.00, alpha=1.00)
+[AutoLog] captured DMoAH (BF16) seq_len=524288 backend=triton
+524288     | DMoAH (INT8)             | 735.03          | 1.36         | 713284.71       | 8602.16         | 1          | 0.02       | flux       | triton (max_rows=869, density=0.00, unique=32, tokens=0.02, dna_blend=0.00, alpha=1.00)
+[AutoLog] captured DMoAH (INT8) seq_len=524288 backend=triton
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+1048576    | Standard Attention       | OOM             | -            | -               | -               | -          | -          | -          | std-limit                           
+1048576    | DMoAH (BF16)             | OOM             | -            | -               | -               | -          | -          | auto       | dmoah-skip                          
+[Notice] DMoAH (BF16) skipping seq_len=1048576 due to limit.
+1048576    | DMoAH (BF16)             | OOM             | -            | -               | -               | -          | -          | -          | dmoah-limit                         
+1048576    | DMoAH (INT8)             | OOM             | -            | -               | -               | -          | -          | auto       | dmoah-skip                          
+[Notice] DMoAH (INT8) skipping seq_len=1048576 due to limit.
+1048576    | DMoAH (INT8)             | OOM             | -            | -               | -               | -          | -          | -          | dmoah-limit                         
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+2097152    | Standard Attention       | OOM             | -            | -               | -               | -          | -          | -          | std-limit                           
+2097152    | DMoAH (BF16)             | OOM             | -            | -               | -               | -          | -          | auto       | dmoah-skip                          
+2097152    | DMoAH (BF16)             | OOM             | -            | -               | -               | -          | -          | -          | dmoah-limit                         
+2097152    | DMoAH (INT8)             | OOM             | -            | -               | -               | -          | -          | auto       | dmoah-skip                          
+2097152    | DMoAH (INT8)             | OOM             | -            | -               | -               | -          | -          | -          | dmoah-limit                         
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+[Summary] Standard safe length: none; DMoAH safe length: 524288.
+[Plot] Saved latency plot to reports/tinytoy/tinytoy_summary_20251101-194329.png
+
+[Summary] Detailed JSON report saved to reports/tinytoy/tinytoy_summary_20251101-194329.json
+[Summary] Captured 26 AutoLog entries.

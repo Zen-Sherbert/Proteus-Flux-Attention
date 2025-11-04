@@ -97,6 +97,15 @@ _BLOCK_CANDIDATES: List[Tuple[int, int, int]] = [
     (128, 128, 64),
 ]
 
+_BRUTE_FORCE_ENABLED = os.getenv("PROTEUS_TUNE_BRUTE_FORCE", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+    "bruteforce",
+}
+_BRUTE_FORCE_WARNED = False
+
 _CACHE_ENV_DIR = os.getenv("PROTEUS_CACHE_DIR")
 if _CACHE_ENV_DIR:
     _CACHE_DIR = Path(_CACHE_ENV_DIR).expanduser()
@@ -182,6 +191,27 @@ def _should_force_autotune() -> bool:
 
 
 def _candidate_block_configs(head_dim: int) -> List[Tuple[int, int, int]]:
+    global _BRUTE_FORCE_WARNED
+    if _BRUTE_FORCE_ENABLED:
+        if not _BRUTE_FORCE_WARNED:
+            warnings.warn(
+                "PROTEUS_TUNE_BRUTE_FORCE enabled; exhaustive block search may take longer.",
+                RuntimeWarning,
+            )
+            _BRUTE_FORCE_WARNED = True
+        combos: List[Tuple[int, int, int]] = []
+        for m in range(16, 129, 16):
+            for n in range(16, 129, 16):
+                for d in range(16, 129, 16):
+                    if head_dim > 0 and d > head_dim:
+                        continue
+                    if head_dim > 0 and head_dim % d != 0:
+                        continue
+                    combos.append((m, n, d))
+        if not combos:
+            combos.append(_BLOCK_DEFAULT_CONFIG)
+        return combos
+
     viable: List[Tuple[int, int, int]] = []
     for cfg in _BLOCK_CANDIDATES:
         m, n, d = cfg
@@ -239,6 +269,80 @@ def _flux_prepare_dna_candidates(
     valid = torch.arange(cap, device=device).unsqueeze(0) < counts.unsqueeze(1)
     dna_candidates = torch.where(valid, top_idx.to(rows.dtype), dna_candidates)
     return dna_candidates
+
+
+def _flux_prepare_dna_candidates_grouped(
+    rows: torch.Tensor,
+    row_batch_ids: Optional[torch.Tensor],
+    seq_len: int,
+    max_candidates: int,
+    dna_scores: Optional[torch.Tensor],
+    dna_cap: int,
+) -> Optional[torch.Tensor]:
+    """
+    Vectorised helper that assembles DNA shortlist candidates for multiple batches at once.
+
+    Parameters
+    ----------
+    rows:
+        Tensor of active token indices with shape ``(N,)``.
+    row_batch_ids:
+        Tensor of shape ``(N,)`` mapping each row to the batch index whose DNA scores should be used.
+    dna_scores:
+        Optional tensor containing DNA similarity values. Expected shape ``(B, seq_len)`` or
+        ``(seq_len,)`` when only a single batch is present.
+    """
+
+    if (
+        dna_scores is None
+        or dna_scores.numel() == 0
+        or dna_cap <= 0
+        or max_candidates <= 0
+        or rows.numel() == 0
+    ):
+        return None
+
+    if dna_scores.dim() == 1:
+        dna_scores = dna_scores.unsqueeze(0)
+
+    if row_batch_ids is None:
+        if dna_scores.size(0) != 1:
+            warnings.warn(
+                "row_batch_ids not provided for grouped DNA candidates; using first DNA vector for all rows.",
+                RuntimeWarning,
+            )
+        row_batch_ids = torch.zeros_like(rows, dtype=torch.long)
+    else:
+        row_batch_ids = row_batch_ids.to(device=rows.device).to(torch.long)
+
+    cap = min(max_candidates, dna_cap, seq_len)
+    if cap <= 0:
+        return None
+
+    device = rows.device
+    dtype = rows.dtype
+    result = rows.unsqueeze(1).expand(-1, cap).to(dtype).clone()
+
+    unique_batches = torch.unique(row_batch_ids.to(torch.long))
+    for batch_id in unique_batches.tolist():
+        mask = row_batch_ids == batch_id
+        if torch.count_nonzero(mask) == 0:
+            continue
+        subset_rows = rows[mask]
+        dna_vec = dna_scores[batch_id]
+        candidates = _flux_prepare_dna_candidates(
+            subset_rows,
+            seq_len,
+            max_candidates=max_candidates,
+            dna_scores=dna_vec,
+            dna_cap=dna_cap,
+        )
+        if candidates is None or candidates.numel() == 0:
+            continue
+        width = min(candidates.size(1), result.size(1))
+        result[mask, :width] = candidates[:, :width].to(device=device, dtype=dtype)
+
+    return result
 
 
 def build_flux_candidates(
@@ -318,6 +422,133 @@ def build_flux_candidates(
         row_idx, src_col = valid_keep.nonzero(as_tuple=True)
         dst_col = unique_indices[row_idx, src_col].to(torch.long)
         output[row_idx, dst_col] = candidates[row_idx, src_col]
+
+    return output.contiguous(), flux_lengths.contiguous()
+
+
+def build_packed_flux_candidates(
+    rows: torch.Tensor,
+    row_batch_ids: Optional[torch.Tensor],
+    seq_len: int,
+    *,
+    max_candidates: int,
+    linear_window: int,
+    anchor_stride: int,
+    use_local: bool,
+    use_anchors: bool,
+    dna_scores: Optional[torch.Tensor] = None,
+    local_cap: Optional[int] = None,
+    anchor_cap: Optional[int] = None,
+    dna_cap: Optional[int] = None,
+    chunk_size: int = 4096,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Assemble Flux shortlist candidates for a packed set of rows spanning multiple heads/batches.
+
+    Parameters mirror :func:`build_flux_candidates`, but ``rows`` contains every active row in the
+    packed structure and ``row_batch_ids`` provides a lookup into ``dna_scores`` so we can generate
+    DNA teleportation slots without looping head-by-head in Python.
+    """
+
+    if rows.numel() == 0 or max_candidates <= 0:
+        empty = rows.new_empty(rows.shape + (0,))
+        return empty, rows.new_zeros(rows.shape, dtype=torch.long)
+
+    device = rows.device
+    dtype = rows.dtype
+
+    local_cap_val = (
+        max(0, int(local_cap))
+        if local_cap is not None
+        else (max_candidates if use_local else 0)
+    )
+    anchor_cap_val = (
+        max(0, int(anchor_cap))
+        if anchor_cap is not None
+        else (max_candidates if use_anchors else 0)
+    )
+    dna_cap_val = (
+        max(0, int(dna_cap))
+        if dna_cap is not None
+        else (max_candidates if dna_scores is not None else 0)
+    )
+
+    chunk_size = max(1, int(chunk_size))
+    total_rows = rows.size(0)
+    output = rows.unsqueeze(1).expand(-1, max_candidates).to(dtype).clone()
+    flux_lengths = torch.ones(total_rows, device=device, dtype=torch.long)
+
+    for start in range(0, total_rows, chunk_size):
+        end = min(start + chunk_size, total_rows)
+        chunk_rows = rows[start:end]
+        chunk_count = chunk_rows.size(0)
+
+        chunk_pieces: list[torch.Tensor] = []
+
+        if use_local and local_cap_val > 0:
+            window = min(linear_window, max_candidates, local_cap_val)
+            if window > 0:
+                steps = torch.arange(window, device=device, dtype=dtype)
+                lengths = torch.clamp(chunk_rows + 1, max=window)
+                start_idx = torch.clamp(chunk_rows - lengths + 1, min=0)
+                local = start_idx.unsqueeze(1) + steps.unsqueeze(0)
+                valid = steps.unsqueeze(0) < lengths.unsqueeze(1)
+                local = torch.where(valid, local, chunk_rows.unsqueeze(1))
+                chunk_pieces.append(local)
+
+        if use_anchors and anchor_stride > 0 and anchor_cap_val > 0:
+            slots = min(anchor_cap_val, max_candidates, max(1, seq_len))
+            if slots > 0:
+                steps = torch.arange(1, slots + 1, device=device, dtype=dtype)
+                anchors = chunk_rows.unsqueeze(1) - steps.unsqueeze(0) * anchor_stride
+                anchors = torch.clamp(anchors, min=0)
+                chunk_pieces.append(anchors)
+
+        if dna_scores is not None and dna_cap_val > 0:
+            chunk_batch_ids = None
+            if row_batch_ids is not None:
+                chunk_batch_ids = row_batch_ids[start:end]
+            dna_chunk = _flux_prepare_dna_candidates_grouped(
+                chunk_rows,
+                chunk_batch_ids,
+                seq_len,
+                max_candidates=max_candidates,
+                dna_scores=dna_scores,
+                dna_cap=dna_cap_val,
+            )
+            if dna_chunk is not None and dna_chunk.numel() > 0:
+                chunk_pieces.append(dna_chunk.to(dtype))
+
+        if chunk_pieces:
+            candidates = torch.cat(chunk_pieces, dim=1)
+        else:
+            candidates = chunk_rows.unsqueeze(1)
+
+        candidates = torch.clamp(candidates, min=0, max=max(seq_len - 1, 0))
+        candidates = torch.minimum(candidates, chunk_rows.unsqueeze(1))
+        candidates = torch.cat([candidates, chunk_rows.unsqueeze(1)], dim=1)
+
+        candidates, _ = torch.sort(candidates, dim=1)
+        keep_mask = torch.ones_like(candidates, dtype=torch.bool)
+        if candidates.size(1) > 1:
+            keep_mask[:, 1:] = candidates[:, 1:] != candidates[:, :-1]
+        keep_mask[:, 0] = True
+
+        unique_indices = keep_mask.to(torch.int64).cumsum(dim=1) - 1
+        valid_keep = keep_mask & (unique_indices >= 0)
+        valid_keep = valid_keep & (unique_indices < max_candidates)
+
+        chunk_lengths = valid_keep.sum(dim=1, dtype=torch.long)
+        chunk_lengths = torch.clamp(chunk_lengths, min=1)
+
+        chunk_output = chunk_rows.unsqueeze(1).expand(-1, max_candidates).to(dtype).clone()
+        if valid_keep.any():
+            row_idx, src_col = valid_keep.nonzero(as_tuple=True)
+            dst_col = unique_indices[row_idx, src_col].to(torch.long)
+            chunk_output[row_idx, dst_col] = candidates[row_idx, src_col]
+
+        output[start:end] = chunk_output
+        flux_lengths[start:end] = chunk_lengths
 
     return output.contiguous(), flux_lengths.contiguous()
 if TRITON_AVAILABLE:
@@ -1236,6 +1467,8 @@ def dmoah_sparse_attention(
                 dropout_p=dropout_real,
                 training=training,
                 prepacked=packed,
+                flux_candidates=flux_runtime_candidates,
+                flux_lengths=flux_runtime_lengths,
             )
         except Exception as exc:  # noqa: BLE001
             warnings.warn(f"Falling back from CUDA kernel: {exc}", RuntimeWarning)
@@ -1362,4 +1595,10 @@ def dmoah_sparse_attention(
     return fallback.reshape_as(q).to(out_dtype)
 
 
-__all__ = ["dmoah_sparse_attention", "get_last_backend", "get_last_backend_info", "build_flux_candidates"]
+__all__ = [
+    "dmoah_sparse_attention",
+    "get_last_backend",
+    "get_last_backend_info",
+    "build_flux_candidates",
+    "build_packed_flux_candidates",
+]

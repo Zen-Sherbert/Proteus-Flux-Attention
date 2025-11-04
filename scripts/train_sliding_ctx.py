@@ -203,15 +203,13 @@ def train_schedule(
 
 
 def parse_args() -> argparse.Namespace:
-    default_dataset = (
-        Path("/var/mnt/SDD/Data/text-english-code-fiction-nonfiction/fiction_100mb.txt")
-    )
+    default_dataset = Path(__file__).resolve().parent / "samples" / "flux_sample.txt"
     parser = argparse.ArgumentParser(description="Sliding-context DMoAH training run.")
     parser.add_argument(
         "--dataset",
         type=Path,
         default=default_dataset,
-        help="Path to training corpus (default: fiction_100mb sample).",
+        help="Path to training corpus (default: scripts/samples/flux_sample.txt).",
     )
     parser.add_argument("--total-steps", type=int, default=20_000)
     parser.add_argument("--short-ctx", type=int, default=512)

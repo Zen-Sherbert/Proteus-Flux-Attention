@@ -7,7 +7,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import proteus_attention.kernels.sparse_attn as sparse_attn
-from proteus_attention.kernels.sparse_attn import build_flux_candidates, dmoah_sparse_attention
+from proteus_attention.kernels.sparse_attn import (
+    build_flux_candidates,
+    build_packed_flux_candidates,
+    dmoah_sparse_attention,
+)
 from proteus_attention.models.dmoah import (
     AttentionBlock,
     CausalDynamicAttention,
@@ -344,6 +348,82 @@ def test_flux_candidates_match_reference_cpu(use_local, use_anchors, use_dna):
     assert torch.equal(flux_lengths, expected_lengths)
 
 
+@pytest.mark.parametrize("use_dna", [False, True])
+def test_build_packed_flux_candidates_matches_per_head(use_dna: bool) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(42)
+
+    active_heads = 3
+    rows_per_head = torch.tensor([5, 3, 4], dtype=torch.long, device=device)
+    row_offsets = torch.zeros(active_heads + 1, dtype=torch.int32, device=device)
+    torch.cumsum(rows_per_head.to(torch.int32), dim=0, out=row_offsets[1:])
+
+    seq_len = 32
+    token_chunks = []
+    for count in rows_per_head.tolist():
+        tokens = torch.randint(0, seq_len, (count,), device=device)
+        tokens, _ = torch.sort(tokens)
+        token_chunks.append(tokens)
+    token_idx = torch.cat(token_chunks, dim=0)
+
+    h_total = 8
+    head_indices = torch.tensor([1, 9, 10], dtype=torch.long, device=device)
+
+    runtime_kwargs = dict(
+        max_candidates=8,
+        linear_window=6,
+        anchor_stride=3,
+        use_local=True,
+        use_anchors=True,
+        local_cap=5,
+        anchor_cap=6,
+        dna_cap=6,
+    )
+
+    if use_dna:
+        dna_scores = torch.rand(2, seq_len, device=device)
+        row_counts = rows_per_head.to(torch.long)
+        head_range = torch.arange(active_heads, device=device, dtype=torch.long)
+        row_head_ids = torch.repeat_interleave(head_range, row_counts)
+        row_batch_ids = (head_indices[row_head_ids] // h_total).to(
+            device=device, dtype=torch.long
+        )
+    else:
+        dna_scores = None
+        row_batch_ids = None
+
+    packed_candidates, packed_lengths = build_packed_flux_candidates(
+        token_idx,
+        row_batch_ids,
+        seq_len,
+        dna_scores=dna_scores,
+        **runtime_kwargs,
+    )
+
+    baseline_candidates = token_idx.unsqueeze(1).expand(-1, runtime_kwargs["max_candidates"]).clone()
+    baseline_lengths = torch.ones(token_idx.size(0), dtype=torch.long, device=device)
+
+    for head in range(active_heads):
+        start = int(row_offsets[head].item())
+        end = int(row_offsets[head + 1].item())
+        rows = token_idx[start:end]
+        dna_vec = None
+        if use_dna:
+            batch_index = int((head_indices[head] // h_total).item())
+            dna_vec = dna_scores[batch_index]
+        candidates, lengths = build_flux_candidates(
+            rows,
+            seq_len,
+            dna_scores=dna_vec,
+            **runtime_kwargs,
+        )
+        baseline_candidates[start:end] = candidates
+        baseline_lengths[start:end] = lengths
+
+    assert torch.equal(packed_candidates, baseline_candidates)
+    assert torch.equal(packed_lengths, baseline_lengths)
+
+
 def test_dmoah_sparse_attention_matches_sdpa_without_mask():
     torch.manual_seed(1)
     batch_heads, tokens, head_dim = 3, 6, 5
@@ -552,6 +632,7 @@ def test_gpt_dmoah_matches_dense_when_all_heads_active():
         attn_h_active=4,
         attn_gates=8,
         attn_router_noise_std=0.0,
+        attn_use_rope=False,
     )
     torch.manual_seed(321)
     model_sparse = GPT(cfg_sparse)

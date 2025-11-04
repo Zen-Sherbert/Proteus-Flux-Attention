@@ -8,7 +8,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from examples import common
-from examples import train_baseline, train_context_slide, train_context_mastery
+from examples import (
+    train_baseline,
+    train_context_slide,
+    train_context_mastery,
+    train_dense_baseline,
+)
 
 
 def _use_tmp_checkpoint(monkeypatch, tmp_path):
@@ -36,6 +41,22 @@ def test_train_baseline_smoke(tmp_path, monkeypatch):
         lr=1e-3,
         device=torch.device("cpu"),
         prompt="hello",
+        sample_tokens=4,
+        data_path=data,
+    )
+    assert "checkpoint" in result
+
+
+def test_train_dense_baseline_smoke(tmp_path, monkeypatch):
+    _use_tmp_checkpoint(monkeypatch, tmp_path)
+    data = _write_corpus(tmp_path)
+    result = train_dense_baseline.run_training(
+        steps=2,
+        seq_len=16,
+        batch_size=2,
+        lr=1e-3,
+        device=torch.device("cpu"),
+        prompt="dense",
         sample_tokens=4,
         data_path=data,
     )

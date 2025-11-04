@@ -59,6 +59,11 @@ def main() -> None:
 
     # Force a fresh autotune run.
     os.environ["PROTEUS_TUNE_FORCE"] = "1"
+    os.environ["PROTEUS_TUNE_BRUTE_FORCE"] = "1"
+    from proteus_attention.kernels import sparse_attn as _sparse_module
+
+    _sparse_module._BRUTE_FORCE_ENABLED = True
+    _sparse_module._BRUTE_FORCE_WARNED = False
 
     head_dims = list(args.head_dims) or [args.embed_dim // args.num_heads]
 
@@ -76,9 +81,13 @@ def main() -> None:
         torch.cuda.synchronize(device)
 
     cache = get_block_config_cache()
-    print("Autotune complete. Cached configurations:")
+    cache_path = _sparse_module._CACHE_FILE
+    print("Autotune complete.")
+    print(f"Results stored in {cache_path}")
+    print("Cached configurations (per device/head_dim):")
     for key, cfg in cache.items():
         print(f"  {key}: BLOCK_M={cfg[0]}, BLOCK_N={cfg[1]}, BLOCK_D={cfg[2]}")
+    print("You can rerun this script after major hardware or driver changes; otherwise the cached values are reused automatically.")
 
 
 if __name__ == "__main__":

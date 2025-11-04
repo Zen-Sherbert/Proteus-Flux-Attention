@@ -20,6 +20,12 @@ from .kernels.sparse_attn import (
     get_last_backend,
     get_last_backend_info,
 )
+from .tools.chunked_flux import (
+    ChunkedFluxConfig,
+    ChunkedFluxMetrics,
+    ChunkedFluxResult,
+    ChunkedFluxRunner,
+)
 
 __all__ = [
     "AttentionBlock",
@@ -31,6 +37,10 @@ __all__ = [
     "dmoah_sparse_attention",
     "get_last_backend",
     "get_last_backend_info",
+    "ChunkedFluxConfig",
+    "ChunkedFluxMetrics",
+    "ChunkedFluxResult",
+    "ChunkedFluxRunner",
     "__version__",
 ]
 

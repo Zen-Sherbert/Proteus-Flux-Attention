@@ -1,6 +1,4 @@
 # benchmark.py
-from proteus_attention.models.dmoah import CausalDynamicAttention
-from proteus_attention.kernels.sparse_attn import get_last_backend_info
 import argparse
 import json
 import os
@@ -9,6 +7,7 @@ import time
 import math
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -18,12 +17,36 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from proteus_attention.models.dmoah import CausalDynamicAttention
+from proteus_attention.kernels.sparse_attn import get_last_backend_info
+from proteus_attention.tools.chunked_flux import ChunkedFluxConfig, ChunkedFluxRunner
+
 # --- Import your custom modules ---
 
 # Ensure CUDA allocator uses expandable segments to reduce fragmentation.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
+
+
+class _FluxAutotuneGuard:
+    """Context manager to toggle Triton autotune for Flux chunk runs only."""
+
+    def __init__(self, disable: bool) -> None:
+        self.disable = disable
+        self._prev: Optional[str] = None
+
+    def __enter__(self) -> None:
+        if not self.disable:
+            return
+        self._prev = os.environ.get("PROTEUS_TUNE_DISABLE")
+        os.environ["PROTEUS_TUNE_DISABLE"] = "1"
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if not self.disable:
+            return
+        if self._prev is None:
+            os.environ.pop("PROTEUS_TUNE_DISABLE", None)
+        else:
+            os.environ["PROTEUS_TUNE_DISABLE"] = self._prev
 
 # --- Helper Functions ---
 
@@ -97,10 +120,10 @@ def get_peak_memory_mb(model, x):
     if device.type != 'cuda':
         return 0.0
 
+    torch.cuda.reset_peak_memory_stats(device)
     model.to(device)
     x = x.to(device)
 
-    torch.cuda.reset_peak_memory_stats(device)
     _ = model(x)
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -109,7 +132,7 @@ def get_peak_memory_mb(model, x):
     return peak_memory_mb
 
 
-DEFAULT_GPU_SEQUENCE_CAP = 1_000_000
+DEFAULT_GPU_SEQUENCE_CAP = 2_000_000
 
 
 def build_sequence_lengths(
@@ -153,7 +176,101 @@ def save_summary_to_disk(summary: dict) -> Path:
     return output_path
 
 
-def build_dmoah_config(seq_len: int, seq_high: int, *, d_model: int, quantize: bool) -> SimpleNamespace:
+def _maybe_generate_plot(
+    runs_summary: list[dict[str, object]],
+    *,
+    plot_requested: bool,
+    plot_path: Path | None,
+    summary_path: Path | None,
+    device_label: str,
+) -> Path | None:
+    if not plot_requested and plot_path is None:
+        return None
+
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception as exc:  # pragma: no cover - optional dependency
+        print(f"[Plot] matplotlib unavailable ({exc}); skipping plot.")
+        return None
+
+    series: dict[str, list[tuple[int, float]]] = {}
+    for entry in runs_summary:
+        if entry.get("status") != "ok":
+            continue
+        latency = entry.get("latency_ms")
+        seq_len = entry.get("seq_len")
+        if latency is None or seq_len is None:
+            continue
+        try:
+            latency_val = float(latency)
+            seq_val = int(seq_len)
+        except (TypeError, ValueError):
+            continue
+        label = entry.get("variant")
+        if isinstance(label, str):
+            key = label
+        else:
+            key = "Standard Attention" if entry.get("model") == "standard" else str(entry.get("model"))
+        series.setdefault(key, []).append((seq_val, latency_val))
+
+    if not series:
+        print("[Plot] No successful runs to plot.")
+        return None
+
+    target_path = plot_path
+    if target_path is None:
+        if summary_path is not None:
+            target_path = summary_path.with_suffix(".png")
+        else:
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            default_dir = PROJECT_ROOT / "reports" / "tinytoy"
+            default_dir.mkdir(parents=True, exist_ok=True)
+            target_path = default_dir / f"tinytoy_plot_{timestamp}.png"
+    target_path = Path(target_path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    plt.figure(figsize=(9, 5))
+    max_x = 0
+    min_x = None
+    max_y = 0.0
+    min_y = None
+    for label, points in sorted(series.items()):
+        if not points:
+            continue
+        points.sort(key=lambda item: item[0])
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        max_x = max(max_x, max(xs))
+        min_x = min(xs) if min_x is None else min(min_x, min(xs))
+        max_y = max(max_y, max(ys))
+        min_y = min(ys) if min_y is None else min(min_y, min(ys))
+        plt.plot(xs, ys, marker="o", label=label)
+
+    if min_x and max_x and max_x > min_x * 2:
+        plt.xscale("log", base=2)
+    if min_y and max_y and max_y > min_y * 4:
+        plt.yscale("log")
+
+    plt.xlabel("Sequence Length")
+    plt.ylabel("Latency (ms)")
+    plt.title(f"Proteus TinyToy Latency — Device: {device_label}")
+    plt.grid(True, which="both", linestyle="--", linewidth=0.4, alpha=0.6)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(target_path, dpi=200)
+    plt.close()
+    print(f"[Plot] Saved latency plot to {target_path.relative_to(PROJECT_ROOT) if target_path.is_relative_to(PROJECT_ROOT) else target_path}")
+    return target_path
+
+
+def build_dmoah_config(
+    seq_len: int,
+    seq_high: int,
+    *,
+    d_model: int,
+    quantize: bool,
+    allow_sdpa_fastpath: bool,
+) -> SimpleNamespace:
     if seq_len <= 256:
         token_keep_ratio = 1.0
         token_keep_min = seq_len
@@ -183,14 +300,14 @@ def build_dmoah_config(seq_len: int, seq_high: int, *, d_model: int, quantize: b
     return SimpleNamespace(
         d_model=d_model,
         p_dropout=0.0,
-        use_sdpa=True,
+        use_sdpa=allow_sdpa_fastpath,
         attn_h_total=32,
         attn_h_active=attn_h_active,
         attn_h_active_min=max(2, attn_h_active // 2),
         attn_h_active_max=max(attn_h_active, 8),
         attn_active_seq_low=256,
         attn_active_seq_high=seq_high,
-        attn_small_seq_dense=0,
+        attn_small_seq_dense=max(128, min(seq_len, 1024)) if allow_sdpa_fastpath else 0,
         n_ctx=seq_high,
         bias=False,
         attn_router_lambda=0.0,
@@ -300,8 +417,6 @@ def _apply_memory_saving_overrides(config: SimpleNamespace, seq_len: int) -> Sim
         getattr(config, "attn_linear_L_min", min_cap), min_cap)
     config.attn_linear_L = min(getattr(
         config, "attn_linear_L", config.attn_linear_L_base), config.attn_linear_L_max)
-    if seq_len >= 262144:
-        config.attn_dna_enable = False
     if seq_len >= 4096:
         if seq_len >= 1_048_576:
             target_budget = 12.0
@@ -334,9 +449,15 @@ def _prepare_dmoah_config(
     d_model: int,
     quantize: bool,
     memory_guard: bool,
+    allow_sdpa_fastpath: bool,
 ) -> SimpleNamespace:
     config = build_dmoah_config(
-        seq_len, seq_high, d_model=d_model, quantize=quantize)
+        seq_len,
+        seq_high,
+        d_model=d_model,
+        quantize=quantize,
+        allow_sdpa_fastpath=allow_sdpa_fastpath,
+    )
     if memory_guard:
         config = _apply_memory_saving_overrides(config, seq_len)
     return config
@@ -371,14 +492,20 @@ def _instantiate_dmoah_model(
     d_model: int,
     quantize: bool,
     memory_guard: bool,
+    allow_sdpa_fastpath: bool,
+    device: torch.device | None = None,
 ) -> tuple[CausalDynamicAttention, SimpleNamespace, float | None]:
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     config = _prepare_dmoah_config(
         seq_len,
         seq_high,
         d_model=d_model,
         quantize=quantize,
         memory_guard=memory_guard,
+        allow_sdpa_fastpath=allow_sdpa_fastpath and device.type == "cuda",
     )
+    setattr(config, "attn_track_latency", False)
     model = CausalDynamicAttention(config)
     alpha: float | None = None
     if hasattr(model, "set_flux_alpha"):
@@ -405,6 +532,7 @@ def _prime_linear_mode(
     d_model: int,
     quantize: bool,
     memory_guard: bool,
+    allow_sdpa_fastpath: bool,
 ) -> None:
     """
     Run a lightweight forward pass in linear mode to trigger Triton compilation ahead of time.
@@ -422,9 +550,11 @@ def _prime_linear_mode(
         d_model=d_model,
         quantize=quantize,
         memory_guard=memory_guard,
+        allow_sdpa_fastpath=allow_sdpa_fastpath,
     )
     config.attn_mode = "linear"
     config.attn_linear_switch_ctx = 1
+    setattr(config, "attn_track_latency", False)
     model = CausalDynamicAttention(config)
     if hasattr(model, "set_flux_alpha"):
         model.set_flux_alpha(1.0)
@@ -435,7 +565,6 @@ def _prime_linear_mode(
         _ = model(input_tensor)
     torch.cuda.synchronize()
     del model
-    torch.cuda.empty_cache()
     _LINEAR_WARM_STATE.add(key)
 
 
@@ -451,7 +580,14 @@ def estimate_safe_length(label: str,
     safe: int | None = None
     for seq_len in sequence_lengths:
         batch_eff = _effective_batch_size(seq_len, batch_size)
-        input_tensor = torch.randn(batch_eff, seq_len, d_model)
+        tensor_device = device if device.type == "cuda" else torch.device("cpu")
+        input_tensor = torch.randn(
+            batch_eff,
+            seq_len,
+            d_model,
+            device=tensor_device,
+            dtype=torch.get_default_dtype(),
+        )
         model = model_factory(seq_len)
         if device.type == 'cuda':
             if seq_len >= 16384:
@@ -473,19 +609,71 @@ def estimate_safe_length(label: str,
             if "cuda" in message or "out of memory" in lower:
                 print(
                     f"[Probe] {label} failed at sequence length {seq_len}: {message.splitlines()[-1]}")
-                torch.cuda.empty_cache()
                 break
             raise
         finally:
             del model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
     if safe is not None:
         print(
             f"[Probe] {label} safe up to sequence length {safe} on this device.")
     else:
         print(f"[Probe] {label} did not complete any probed lengths safely.")
+    return safe
+
+
+def estimate_flux_chunk_safe_length(
+    *,
+    sequence_lengths: list[int],
+    base_batch_size: int,
+    d_model: int,
+    device: torch.device,
+    flux_args: argparse.Namespace,
+) -> int | None:
+    if not flux_args.enable_flux_chunk:
+        return None
+
+    safe: int | None = None
+    for seq_len in sequence_lengths:
+        batch_eff = _effective_batch_size(seq_len, base_batch_size)
+        if batch_eff != 1:
+            continue
+        buffer_tokens = max(1, int(seq_len * flux_args.flux_chunk_buffer_ratio))
+        flux_config = ChunkedFluxConfig(
+            seq_len=seq_len,
+            d_model=d_model,
+            chunk_len=max(1, flux_args.flux_chunk_len),
+            buffer_tokens=buffer_tokens,
+            per_chunk_budget=max(1, flux_args.flux_chunk_budget),
+            device=device,
+            heads=8,
+            chunk_sparse_ratio=max(1e-4, flux_args.flux_chunk_sparse_ratio),
+            final_sparse_ratio=max(1e-4, flux_args.flux_chunk_final_ratio),
+            flux_alpha=flux_args.flux_chunk_alpha,
+            seed=123,
+            report_latency=False,
+            progress=False,
+            run_final_pass=True,
+        )
+        sequence = torch.randn(1, seq_len, d_model)
+        print(f"[Probe] FluxChunk testing seq_len={seq_len}", flush=True)
+        guard = _FluxAutotuneGuard(disable=(device.type == "cuda"))
+        with guard:
+            runner = ChunkedFluxRunner(flux_config)
+            try:
+                runner.run(sequence=sequence)
+                safe = seq_len
+            except RuntimeError as exc:
+                message = str(exc)
+                lower = message.lower()
+                if device.type == "cuda" and ("out of memory" in lower or "cuda" in message or "hip" in lower):
+                    print(f"[Probe] FluxChunk failed at sequence length {seq_len}: {message.splitlines()[-1]}")
+                    break
+                raise
+            finally:
+                del runner
+    if safe is not None:
+        print(f"[Probe] FluxChunk safe up to sequence length {safe} on this device.")
     return safe
 
 
@@ -503,12 +691,11 @@ class StandardAttention(nn.Module):
             dropout=0.0,
             batch_first=True
         )
-        self.proj = nn.Linear(config.d_model, config.d_model)
 
     def forward(self, x):
         # MultiheadAttention expects (query, key, value)
         attn_output, _ = self.attn(x, x, x, need_weights=False)
-        return self.proj(attn_output)
+        return attn_output
 
 # --- Main Benchmark Execution ---
 
@@ -554,6 +741,99 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Force CUDA default dtype to float32 (overrides the default bfloat16).",
     )
+    parser.add_argument(
+        "--bruteforce-blocks",
+        action="store_true",
+        help="Enable exhaustive block-size autotuning (PROTEUS_TUNE_BRUTE_FORCE=1).",
+    )
+    parser.add_argument(
+        "--plot",
+        dest="plot",
+        action="store_true",
+        default=True,
+        help="Generate a latency plot (default; requires matplotlib).",
+    )
+    parser.add_argument(
+        "--no-plot",
+        dest="plot",
+        action="store_false",
+        help="Disable latency plot generation.",
+    )
+    parser.add_argument(
+        "--plot-path",
+        type=Path,
+        default=None,
+        help="Optional path for the latency plot image (implies --plot).",
+    )
+    parser.add_argument(
+        "--enable-flux-chunk",
+        action="store_true",
+        help="Enable FluxChunk pipeline for extreme sequence lengths.",
+    )
+    parser.add_argument(
+        "--flux-chunk-threshold",
+        type=int,
+        default=1_000_000,
+        help="Minimum sequence length that triggers FluxChunk when enabled.",
+    )
+    parser.add_argument(
+        "--flux-chunk-len",
+        type=int,
+        default=65_536,
+        help="Streaming chunk length used by FluxChunk (capped at 65k tokens to avoid ROCm compiler asserts).",
+    )
+    parser.add_argument(
+        "--flux-chunk-buffer-ratio",
+        type=float,
+        default=0.05,
+        help="Fraction of tokens retained after FluxChunk streaming (buffer size = ratio * seq_len).",
+    )
+    parser.add_argument(
+        "--flux-chunk-budget",
+        type=int,
+        default=4_096,
+        help="Per-chunk promotion budget for FluxChunk streaming.",
+    )
+    parser.add_argument(
+        "--flux-chunk-sparse-ratio",
+        type=float,
+        default=0.05,
+        help="Sparse keep ratio used during FluxChunk streaming stage.",
+    )
+    parser.add_argument(
+        "--flux-chunk-final-ratio",
+        type=float,
+        default=0.5,
+        help="Sparse keep ratio used during FluxChunk final pass.",
+    )
+    parser.add_argument(
+        "--flux-chunk-alpha",
+        type=float,
+        default=1.0,
+        help="Flux alpha slider (0=dense, 1=fully sparse linear shortlist).",
+    )
+    parser.add_argument(
+        "--flux-chunk-report-latency",
+        action="store_true",
+        help="Capture CUDA latency metrics inside the FluxChunk pipeline.",
+    )
+    parser.add_argument(
+        "--flux-chunk-storage",
+        choices=["cpu", "disk"],
+        default="cpu",
+        help="Stage chunk data in system RAM ('cpu') or spill to temporary disk ('disk').",
+    )
+    parser.add_argument(
+        "--flux-chunk-temp-dir",
+        type=Path,
+        default=None,
+        help="Optional directory to use when --flux-chunk-storage=disk (defaults to system tmp).",
+    )
+    parser.add_argument(
+        "--allow-sdpa-fastpath",
+        action="store_true",
+        help="Permit PyTorch SDPA fast-path for very short sequences (defaults to disabled so Flux kernels are benchmarked).",
+    )
     return parser.parse_args(argv)
 
 
@@ -570,12 +850,39 @@ def resolve_device_choice(choice: str) -> torch.device:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
+    fluxchunk_enabled = args.enable_flux_chunk
+    if fluxchunk_enabled:
+        if args.flux_chunk_threshold < 1:
+            raise ValueError("flux-chunk-threshold must be a positive integer.")
+        if args.flux_chunk_len <= 0:
+            raise ValueError("flux-chunk-len must be positive.")
+        if args.flux_chunk_buffer_ratio <= 0.0:
+            raise ValueError("flux-chunk-buffer-ratio must be positive.")
+        if args.flux_chunk_budget <= 0:
+            raise ValueError("flux-chunk-budget must be positive.")
+        if args.flux_chunk_sparse_ratio <= 0.0:
+            raise ValueError("flux-chunk-sparse-ratio must be positive.")
+        if args.flux_chunk_final_ratio <= 0.0:
+            raise ValueError("flux-chunk-final-ratio must be positive.")
+        if not (0.0 <= args.flux_chunk_alpha <= 1.0):
+            raise ValueError("flux-chunk-alpha must lie within [0, 1].")
+
+    if args.bruteforce_blocks:
+        os.environ["PROTEUS_TUNE_BRUTE_FORCE"] = "1"
+        from proteus_attention.kernels import sparse_attn as _sparse_module
+
+        _sparse_module._BRUTE_FORCE_ENABLED = True
+        _sparse_module._BRUTE_FORCE_WARNED = False
+
     if args.max_seq_len is not None and args.max_seq_len < 1:
         raise ValueError("max-seq-len must be a positive integer.")
     if args.max_seq_count is not None and args.max_seq_count < 1:
         raise ValueError("max-seq-count must be a positive integer.")
 
     device = resolve_device_choice(args.device)
+    allow_sdpa_fastpath = bool(args.allow_sdpa_fastpath and device.type == "cuda")
+    if device.type == "cuda" and not allow_sdpa_fastpath:
+        print("[Config] SDPA fast-path disabled; benchmarking Flux kernels only.")
 
     if args.cuda_bf16 and args.cuda_fp32:
         raise ValueError("Specify at most one of --cuda-bf16 or --cuda-fp32.")
@@ -586,6 +893,11 @@ def main(argv: list[str] | None = None) -> None:
         if args.cuda_bf16:
             use_bf16 = True
         torch.set_default_dtype(torch.bfloat16 if use_bf16 else torch.float32)
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except AttributeError:
+            pass
 
     # --- Configuration ---
     # We will use the same d_model but vary the head configurations
@@ -616,6 +928,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Sequence lengths: {sequence_lengths}\n")
 
     probe_lengths = sequence_lengths if not args.skip_probe else []
+    safe_fluxchunk = None
     if device.type == 'cuda' and probe_lengths:
         safe_std = None
         safe_dmoah = None
@@ -635,6 +948,8 @@ def main(argv: list[str] | None = None) -> None:
                 d_model=D_MODEL,
                 quantize=False,
                 memory_guard=args.memory_guard,
+                allow_sdpa_fastpath=allow_sdpa_fastpath,
+                device=device,
             )
             return model
 
@@ -645,9 +960,19 @@ def main(argv: list[str] | None = None) -> None:
             d_model=D_MODEL,
             model_factory=_factory,
         )
+        if fluxchunk_enabled:
+            safe_fluxchunk = estimate_flux_chunk_safe_length(
+                sequence_lengths=probe_lengths,
+                base_batch_size=BASE_BATCH_SIZE,
+                d_model=D_MODEL,
+                device=device,
+                flux_args=args,
+            )
     else:
         safe_std = max(sequence_lengths) if not args.disable_standard else None
         safe_dmoah = max(sequence_lengths)
+        if fluxchunk_enabled:
+            safe_fluxchunk = max(sequence_lengths)
 
     runs_summary: list[dict[str, object]] = []
 
@@ -677,14 +1002,37 @@ def main(argv: list[str] | None = None) -> None:
                 d_model=D_MODEL,
                 quantize=quantize,
                 memory_guard=args.memory_guard,
+                allow_sdpa_fastpath=allow_sdpa_fastpath,
             )
     dmoah_limit_announced = {key: False for _, _, key in variant_configs}
     variant_active = {key: True for _, _, key in variant_configs}
     variant_last_success = {key: None for _, _, key in variant_configs}
+    fluxchunk_active = True
+    fluxchunk_limit_announced = False
+    fluxchunk_last_success: int | None = None
     auto_logs: list[dict[str, object]] = []
+    input_cache: dict[tuple[int, int, torch.dtype, str], torch.Tensor] = {}
+
+    def _get_input(batch: int, length: int) -> torch.Tensor:
+        current_dtype = torch.get_default_dtype()
+        device_label = device.type if device.type != "cuda" else f"{device.type}:{device.index or 0}"
+        key = (batch, length, current_dtype, device_label)
+        cached = input_cache.get(key)
+        if cached is None:
+            tensor = torch.randn(
+                batch,
+                length,
+                D_MODEL,
+                device=device if device.type == "cuda" else torch.device("cpu"),
+                dtype=current_dtype,
+            )
+            input_cache[key] = tensor
+            return tensor
+        return cached
+
     for seq_len in sequence_lengths:
         batch_eff = _effective_batch_size(seq_len, BASE_BATCH_SIZE)
-        input_tensor = torch.randn(batch_eff, seq_len, D_MODEL)
+        input_tensor = _get_input(batch_eff, seq_len)
 
         run_standard = (not args.disable_standard) and (
             safe_std is None or seq_len <= safe_std or device.type != 'cuda')
@@ -693,14 +1041,13 @@ def main(argv: list[str] | None = None) -> None:
             "model": "standard",
             "batch_size": batch_eff,
         }
+        baseline_success = False
         if run_standard:
             model_std = StandardAttention(config_standard)
             latency_std = benchmark_forward_pass(model_std, input_tensor)
             throughput_std = (1000 / latency_std) * batch_eff
             mem_std = get_peak_memory_mb(model_std, input_tensor)
             del model_std
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
             tokens_std = throughput_std * seq_len
             std_latency = f"{latency_std:<15.2f}"
             std_throughput = f"{throughput_std:<12.2f}"
@@ -708,6 +1055,7 @@ def main(argv: list[str] | None = None) -> None:
             std_backend = "torch.nn"
             std_mode = "-"
             last_std_success = seq_len
+            baseline_success = True
             std_record.update({
                 "latency_ms": latency_std,
                 "throughput_seq_s": throughput_std,
@@ -743,6 +1091,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         runs_summary.append(std_record)
 
+        variant_status_map: dict[str, str] = {}
         for variant_label, quantize, variant_key in variant_configs:
             run_variant = variant_active[variant_key] and (
                 safe_dmoah is None or seq_len <= safe_dmoah or device.type != 'cuda')
@@ -775,6 +1124,8 @@ def main(argv: list[str] | None = None) -> None:
                     d_model=D_MODEL,
                     quantize=quantize,
                     memory_guard=args.memory_guard,
+                    allow_sdpa_fastpath=allow_sdpa_fastpath,
+                    device=device,
                 )
                 mode_setting = getattr(config_dmoah, "attn_mode", "auto")
                 flux_alpha = alpha_override
@@ -883,8 +1234,6 @@ def main(argv: list[str] | None = None) -> None:
                     mode_display = mode_setting if run_variant else "-"
                     tokens_per_s = None
                 del model_dmoah
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
             else:
                 flux_backend = None
 
@@ -960,17 +1309,161 @@ def main(argv: list[str] | None = None) -> None:
                     "status": "limit",
                 })
 
+            variant_status_map[variant_key] = status
             runs_summary.append(record)
+
+        if fluxchunk_enabled:
+            has_dmoah_success = any(
+                status == "ok" for status in variant_status_map.values()
+            )
+            should_run_fluxchunk = fluxchunk_active and (
+                seq_len >= args.flux_chunk_threshold
+                or not has_dmoah_success
+            )
+            if should_run_fluxchunk:
+                buffer_tokens = max(1, int(seq_len * args.flux_chunk_buffer_ratio))
+                flux_config = ChunkedFluxConfig(
+                    seq_len=seq_len,
+                    d_model=D_MODEL,
+                    chunk_len=args.flux_chunk_len,
+                    buffer_tokens=buffer_tokens,
+                    per_chunk_budget=args.flux_chunk_budget,
+                    device=device,
+                    heads=config_standard.n_head,
+                    chunk_sparse_ratio=args.flux_chunk_sparse_ratio,
+                    final_sparse_ratio=args.flux_chunk_final_ratio,
+                    flux_alpha=args.flux_chunk_alpha,
+                    seed=None,
+                    report_latency=args.flux_chunk_report_latency and device.type == "cuda",
+                    progress=False,
+                    run_final_pass=True,
+                    storage=args.flux_chunk_storage,
+                    temp_dir=args.flux_chunk_temp_dir,
+                )
+                record_flux = {
+                    "seq_len": seq_len,
+                    "model": "dmoah_fluxchunk",
+                    "variant": f"FluxChunk ({dtype_label})",
+                    "quantized": False,
+                    "batch_size": batch_eff,
+                    "flux_alpha": args.flux_chunk_alpha,
+                }
+                sequence_cpu = input_tensor[:1].detach().to("cpu", dtype=torch.float32).contiguous()
+                guard = _FluxAutotuneGuard(disable=(device.type == "cuda"))
+                try:
+                    with guard:
+                        flux_runner = ChunkedFluxRunner(flux_config)
+                        flux_result = flux_runner.run(sequence=sequence_cpu)
+                except RuntimeError as exc:
+                    message = str(exc)
+                    lower = message.lower()
+                    if device.type == 'cuda' and ("out of memory" in lower or "cuda" in message or "hip" in lower):
+                        fluxchunk_active = False
+                        record_flux.update({
+                            "latency_ms": None,
+                            "throughput_seq_s": None,
+                            "tokens_per_s": None,
+                            "memory_mb": None,
+                            "status": "limit",
+                        })
+                        info = fluxchunk_last_success if fluxchunk_last_success is not None else "<unknown>"
+                        if not fluxchunk_limit_announced:
+                            print(f"[Notice] FluxChunk hit its limit at seq_len={seq_len} (last safe ~{info}).")
+                            fluxchunk_limit_announced = True
+                        print(
+                            f"{seq_len:<10} | {'DMoAH + FluxChunk':<24} | {'OOM':<15} | {'-':<12} | {'-':<15} | {'-':<15} | {'-':<10} | {'-':<10} | {'-':<10} | {'fluxchunk-limit':<36}"
+                        )
+                    else:
+                        raise
+                else:
+                    metrics = flux_result.metrics
+                    latency = metrics.total_time_ms or 0.0
+                    throughput = (1000 / latency) * batch_eff if latency > 0 else None
+                    tokens_per_s = throughput * seq_len if throughput is not None else None
+                    mem_use = metrics.peak_memory_mb
+                    retention = metrics.retention_ratio
+                    final_stats = flux_result.final_stats or {}
+                    backend_info = flux_result.backend_info or {}
+                    backend_name = str(backend_info.get("name", "fluxchunk"))
+                    detail_parts: list[str] = []
+                    if metrics.chunk_time_ms is not None:
+                        detail_parts.append(f"chunk={metrics.chunk_time_ms:.1f}ms")
+                    if metrics.final_time_ms is not None:
+                        detail_parts.append(f"final={metrics.final_time_ms:.1f}ms")
+                    if retention is not None:
+                        detail_parts.append(f"retain={retention:.4f}")
+                    if metrics.used_fallback:
+                        detail_parts.append("fallback")
+                    backend_display = f"fluxchunk/{backend_name}"
+                    if detail_parts:
+                        backend_display = f"{backend_display} ({', '.join(detail_parts)})"
+                    target_k = None
+                    if isinstance(final_stats, dict):
+                        target_k = final_stats.get("target_k") or final_stats.get("top_k")
+                    active_k_display = "-" if target_k is None else f"{int(target_k)}"
+                    token_keep_display = f"{retention:.2f}" if retention is not None else "-"
+                    mode_display = str(final_stats.get("mode_selected") or final_stats.get("mode") or "fluxchunk")
+                    display_latency = f"{latency:<15.2f}" if latency else f"{'-':<15}"
+                    display_throughput = f"{throughput:<12.2f}" if throughput is not None else f"{'-':<12}"
+                    display_tokens = f"{tokens_per_s:<15.2f}" if tokens_per_s is not None else f"{'-':<15}"
+                    display_memory = f"{mem_use:<15.2f}" if mem_use is not None else f"{'-':<15}"
+                    backend_display_print = backend_display
+                    if len(backend_display_print) > 36:
+                        backend_display_print = backend_display_print[:33] + "..."
+                    print(
+                        f"{seq_len:<10} | {'DMoAH + FluxChunk':<24} | {display_latency} | {display_throughput} | {display_tokens} | {display_memory} | {active_k_display:<10} | {token_keep_display:<10} | {mode_display:<10} | {backend_display_print:<36}"
+                    )
+                    record_flux.update({
+                        "latency_ms": latency,
+                        "throughput_seq_s": throughput,
+                        "tokens_per_s": tokens_per_s,
+                        "memory_mb": mem_use,
+                        "active_k": target_k,
+                        "token_fraction": retention,
+                        "backend": backend_display,
+                        "fluxchunk_backend": backend_name,
+                        "mode": mode_display,
+                        "status": "ok",
+                        "fluxchunk_chunk_time_ms": metrics.chunk_time_ms,
+                        "fluxchunk_final_time_ms": metrics.final_time_ms,
+                        "fluxchunk_retained_tokens": metrics.retained_tokens,
+                    })
+                    auto_logs.append({
+                        "model": record_flux["model"],
+                        "variant": "fluxchunk",
+                        "label": f"FluxChunk ({dtype_label})",
+                        "seq_len": seq_len,
+                        "batch_size": batch_eff,
+                        "latency_ms": latency,
+                        "tokens_per_s": tokens_per_s,
+                        "throughput_seq_s": throughput,
+                        "mode_selected": mode_display,
+                        "backend": backend_name,
+                        "backend_info": backend_info,
+                        "token_fraction": retention,
+                        "active_k": target_k,
+                        "chunk_time_ms": metrics.chunk_time_ms,
+                        "final_time_ms": metrics.final_time_ms,
+                        "retained_tokens": metrics.retained_tokens,
+                        "used_fallback": metrics.used_fallback,
+                        "flux_alpha": args.flux_chunk_alpha,
+                    })
+                    fluxchunk_last_success = seq_len
+                    del flux_result
+                    del flux_runner
+                runs_summary.append(record_flux)
 
         print("-" * 212)
 
     if device.type == 'cuda':
         std_msg = safe_std if safe_std is not None else "none"
         dmoah_msg = safe_dmoah if safe_dmoah is not None else "none"
+        flux_msg = safe_fluxchunk if safe_fluxchunk is not None else ("disabled" if not fluxchunk_enabled else "none")
         print(
-            f"\n[Summary] Standard safe length: {std_msg}; DMoAH safe length: {dmoah_msg}.")
+            f"\n[Summary] Standard safe length: {std_msg}; DMoAH safe length: {dmoah_msg}; Chunked Flux safe length: {flux_msg}.")
     else:
         std_msg = dmoah_msg = "cpu"
+        flux_msg = "cpu" if fluxchunk_enabled else "disabled"
 
     std_last_safe = max((entry["seq_len"] for entry in runs_summary if entry.get(
         "model") == "standard" and entry.get("status") == "ok"), default=None)
@@ -990,14 +1483,18 @@ def main(argv: list[str] | None = None) -> None:
         "device": str(device),
         "safe_standard": std_msg,
         "safe_dmoah": dmoah_msg,
+        "safe_fluxchunk": flux_msg,
         "last_safe_standard": std_last_safe,
         "last_safe_variants": last_safe_variants,
+        "last_safe_fluxchunk": fluxchunk_last_success,
         "sequence_lengths": list(sequence_lengths),
         "base_batch_size": BASE_BATCH_SIZE,
         "d_model": D_MODEL,
         "variant_labels": {key: label for label, _, key in variant_configs},
         "runs": runs_summary,
     }
+    if fluxchunk_enabled:
+        safe_record["variant_labels"]["fluxchunk"] = f"FluxChunk ({dtype_label})"
     safe_record["auto_logs"] = auto_logs
 
     def _estimate_alpha(model_key: str) -> float | None:
@@ -1042,6 +1539,17 @@ def main(argv: list[str] | None = None) -> None:
         else:
             summary_path = save_summary_to_disk(safe_record)
 
+    plot_requested = args.plot or args.plot_path is not None
+    plot_generated: Path | None = None
+    if plot_requested:
+        plot_generated = _maybe_generate_plot(
+            runs_summary,
+            plot_requested=plot_requested,
+            plot_path=args.plot_path,
+            summary_path=summary_path,
+            device_label=str(device),
+        )
+
     if summary_path is not None:
         try:
             relative_summary_path = summary_path.relative_to(PROJECT_ROOT)
@@ -1053,6 +1561,8 @@ def main(argv: list[str] | None = None) -> None:
         print("\n[Summary] JSON report saving disabled for this run.")
     if auto_logs:
         print(f"[Summary] Captured {len(auto_logs)} AutoLog entries.")
+    if plot_generated is None and plot_requested:
+        print("[Plot] Plot generation skipped.")
 
 
 if __name__ == "__main__":
