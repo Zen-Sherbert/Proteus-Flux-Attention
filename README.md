@@ -2,60 +2,54 @@
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Zen-Sherbert/Proteus-Attention/blob/main/TinyPlayground.ipynb)
 
-I want to start by thanking you for visiting and taking an interest in my project.
+Proteus is an experimental attention architecture designed for extreme-scale context processing. It implements a collection of techniques, centered around the **Dynamic Mixture-of-Attention-Heads (DMoAH)** mechanism, to manage computational and memory complexity as sequence lengths grow.
 
-To get right to the point: this is an experimental attention architecture. The entire goal of this system is to enable **extreme long context on humble devices.**
+The system is built with custom Triton kernels for high performance on CUDA-enabled hardware, with a graceful fallback to a pure PyTorch implementation for compatibility.
 
-Are you tired of seeing new models with million-token context windows that require a mountain of H100s to run? Did you, like me, not get a small loan of a million dollars to build a GPU cluster?
+## Core Components
 
-> *(I know this sounds like a sales pitch. I've been up all night fueled by coffee and decided it was the best time to make myself useful.)*
-
-Look no further. I got you covered.
-
-> ### Why use a hundred GPUs, when one is good enough?
-
----
-
-## The Philosophy: The Life of a Humble Token
-
-To understand how Proteus works, let's forget about the complex math for a second and look at it from the eyes of a single word.
-
-**Our story begins.** We are a lonely token, the word **"Potato,"** trapped on page 55,555 of some godforsaken document. We're just straight chilling, surrounded by millions of other, less interesting (but still cool) words.
-
-For most AI models, we are invisible, lost in the noise. But for Proteus, our story is just beginning.
-
-**1. The User:** A user, at the very end of the document, asks: *"How do you make potato soup?"*
-
-**2. DNA (cue your favorite CSI show):** Suddenly, a signal flashes through the entire document. The DNA system, a set of "salience gates" that have learned the "flavor" of important concepts, is activated. A gate that has evolved to recognize "food" and "recipes" sees us. It gives our "Potato" token a massive "importance score." We are no longer just a word; we are a **clue.**
-<br>
->*(This was literally a random add-on that just kind of made itself more and more useful.)*
-
-**3. Chunking (Yes, that chunking):** The document is being read in "chunks" of a few thousand tokens at a time. Our "Potato" token is now in a local arena, competing with the other words in its immediate neighborhood. Because of its high score, it easily wins a spot as one of the "champions" of its chunk. It gets promoted.
-<br>
->*(ML is not my original arena; game design is. So this comes from that.)*
-
-**4. The Buffer:** This is the big one. Our "Potato" token is now sent to the main stage, a fixed-size buffer that acts as a "Hall of Heroes." Here, it must compete with the champions from *every other chunk* in the entire document. A weak word like "therefore" from page 100 is kicked out to make room. Our "Potato," being a key part of the answer, earns its permanent spot.
-<br>
->*(This is what gives us decent info across a massive document. You can set it to whatever size your GPU can balance between the active chunk and buffer.)*
-
-**5. Teleportation:** The final reasoning pass begins. The model is not looking at the full, noisy document. It is looking at the curated "Hall of Heroes." In this small, high-signal space, it sees the user's query ("potato soup") and our "Potato" token in the same view. Thanks to **RoPE**, it knows our token came from page 55,555.
-
-The system has just created an **Einstein-Rosen Bridge** through the document, connecting the query at the end to our lonely "Potato" token from the distant past. It has teleported the answer to the user.
-
-Wild, I know.
->*(This seems far-fetched, and I literally had to slam my head into my keyboard to understand this. Percussive osmosis does not work.)*
+*   **Dynamic Mixture-of-Attention-Heads (DMoAH):** A sparse attention mechanism that dynamically routes each token to a small subset of specialized attention heads, rather than using all heads for all tokens.
+*   **Prototype-Guided Routing:** The head selection process is guided by learned "prototype" vectors that provide semantic priors to the router, improving selection quality.
+*   **Adaptive Sparsity:** The system employs both head-level and token-level sparsity. It can automatically adjust the number of active heads and tokens based on sequence length and a target computational density.
+*   **Multi-Mode Attention:** The attention module can operate in several modes and switch between them automatically:
+    *   **Dense:** A standard attention pass used for very short sequences.
+    *   **Sparse (Sub-quadratic):** The default DMoAH mode with token and head routing.
+    *   **Shortlist (Linear Time):** For very long contexts, this mode uses a shortlist-based candidate generation to achieve linear time complexity.
+*   **Chunked Shortlist Pipeline:** A two-pass architecture for processing sequences that exceed available VRAM. It streams the input, builds a "shortlist" of salient tokens, and performs a final attention pass on the distilled result.
 
 ---
 
-## Don't Trust Me. Prove It to Yourself.
+## Performance Demonstration
 
-Talk is cheap. The only thing that matters is proof.
+The following benchmark was run on a single GPU with 16GB of VRAM using the `scripts/tinytoy.py` script. It compares the performance and memory usage of Proteus Attention (DMoAH) against a standard PyTorch `nn.MultiheadAttention` implementation across various sequence lengths.
 
-This entire project is packaged into a single Google Colab notebook. You don't need a powerful machine; you just need a web browser. In it, you will find:
+| Seq Len | Model              | Latency (ms) | Memory (MB) | Mode      | Result                                         |
+| :------ | :----------------- | :----------- | :---------- | :-------- | :--------------------------------------------- |
+| 4,096   | Standard Attention | 11.77        | 1,138.46    | -         | Success                                        |
+| 4,096   | DMoAH (BF16)       | 15.62        | 384.14      | `sparse`  | Success                                        |
+| **16,384**  | Standard Attention | **69.17**        | **4,234.35**    | -         | **Success**                                    |
+| **16,384**  | DMoAH (BF16)       | **51.98**        | **839.76**      | `sparse`  | **Success**                                    |
+| **32,768**  | Standard Attention | -            | -           | -         | **Out of Memory**                              |
+| 32,768  | DMoAH (BF16)       | 99.63        | 961.17      | `shortlist` | Success                                        |
+| 131,072 | DMoAH (BF16)       | 287.66       | 2,813.49    | `shortlist` | Success                                        |
+| **524,288** | DMoAH (BF16)       | **1947.55**      | **11,081.79**   | `shortlist` | **Success**                                    |
+| **1,048,576** | DMoAH (BF16)       | -            | -           | `shortlist` | **Out of Memory**                              |
 
-*   **The Live Benchmark:** Run a head-to-head comparison against standard attention on a free T4 GPU and watch it break the memory wall.
-*   **The Validation Suite:** Run the full set of "Needle in a Haystack" and "Jigsaw Puzzle" tests that prove the mechanics are sound.
-*   **The Scaling Demo:** Watch the Flux Chunking system chew through millions of tokens with a tiny, fixed memory footprint.
+### Key Observations:
+
+1.  **Memory Scaling:** Standard attention's memory usage grows quadratically, leading to an Out-of-Memory (OOM) error at 32,768 tokens. DMoAH's memory usage scales far more gracefully due to its sparse architecture.
+2.  **Context Length:** On the same hardware, Proteus Attention successfully processes a context length of **524,288 tokens**—a **32x increase** over the standard implementation's limit.
+3.  **Adaptive Modes:** The `Mode` column shows the system automatically transitioning from `sparse` to `shortlist` attention at 32,768 tokens to maintain efficiency at longer scales.
+
+---
+
+## Interactive Playground
+
+The best way to validate these results is to run them yourself. The entire benchmark and validation suite is packaged into a single Google Colab notebook that runs on a free T4 GPU.
+
+*   **Live Benchmark:** Run a head-to-head comparison against standard attention.
+*   **Validation Suite:** Execute a full set of "Needle in a Haystack" and "Jigsaw Puzzle" tests to verify the mechanics.
+*   **Scaling Demo:** Observe the Chunked Shortlist system processing million-token sequences with a fixed memory footprint.
 
 **[► Click here to open the Proteus Playground in Google Colab](https://colab.research.google.com/github/Zen-Sherbert/Proteus-Attention/blob/main/TinyPlayground.ipynb)**
 
@@ -63,38 +57,31 @@ This entire project is packaged into a single Google Colab notebook. You don't n
 
 ## Quickstart
 
-If you want to run it on your own machine:
+To install and run the benchmarks locally:
 
 ```bash
-# 1. Clone the repo
+# 1. Clone the repository
 git clone https://github.com/Zen-Sherbert/Proteus-Attention.git
-
-# 2. CD into the directory
 cd Proteus-Attention
 
-# 3. Install the package
-pip install .
+# 2. Install the package in editable mode
+# (Requires PyTorch and a CUDA-enabled environment for full performance)
+pip install -e .
 
-# 4. Run the tests and benchmarks from the /scripts folder!
-python scripts/chunked_flux_tests.py
+# 3. Run the primary performance benchmark
+python scripts/tinytoy.py
+
+# 4. Run the synthetic validation tests for the chunking mechanism
+python scripts/chunked_shortlist_tests.py
 ```
 
----
+## Repository Contents
 
-## About This Project
+*   `src/proteus_attention/`: The core library code, including the DMoAH implementation and Triton kernels.
+*   `examples/`: A collection of training scripts demonstrating various strategies like baseline training, curriculum learning (`train_context_slide.py`), and adaptive training (`train_context_mastery.py`).
+*   `scripts/`: Standalone utilities for benchmarking (`tinytoy.py`), validation (`chunked_shortlist_tests.py`), and system checks.
+*   `TinyPlayground.ipynb`: The interactive Google Colab notebook for demonstration and experimentation.
 
-If you're wondering what brought about this mess, you may look here.
+## Project Status
 
-I built this on my 7800XT with 16GB of VRAM because I was told that it was impossible to run a model of a certain size with a context window of a certain size.
-
-I did not like that.
-
-My time is a precious commodity, and so is money. I do not have the resources of a major lab. I was never gifted a small loan of a million dollars.
-
-So to put it all into perspective, this was made in the middle of the night during my shift as an overnight asset protection officer. It was made while bouncing my two-year-old daughter in my lap, while she donated her own additions to my system in the form of slapping my keyboard.
-
-If anyone else ends up seeing this, do not be intimidated by a challenge. The odds will always be stacked one way or the other.
-
-I am a 32-year-old veteran, a father of three, working like a vampire in the middle of the night, with no formal education in ML.
-
-So if I can make this, you can do anything infinitely better.
+This is an experimental architecture and an active area of research. The APIs and underlying mechanisms are subject to change.
