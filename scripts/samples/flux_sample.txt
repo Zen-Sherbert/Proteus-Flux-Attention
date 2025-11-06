@@ -1,8 +1,8 @@
-Flux chunking lets us sift through vast sequences while still spotting the signal.
+Shortlist chunking lets us sift through vast sequences while still spotting the signal.
 In this synthetic passage, an important detail appears far from the introduction.
 Weeks after the expedition departed, the log recorded the cipher phrase: Titan vault code 9876.
 Subsequent notes rambled about provisions, detours, crew morale, and unrelated trivia.
 Even so, the Titan vault code 9876 needed to survive any shortlist we constructed.
 Later entries mentioned spare parts, focus drills, and calibration sweeps by the engineer Leia.
 When analysts reviewed the condensed buffer, they confirmed the Titan vault code 9876 still surfaced.
-This makes the snippet a handy "needle" for chunked Flux regression checks.
+This makes the snippet a handy "needle" for chunked Shortlist regression checks.

@@ -203,13 +203,13 @@ def train_schedule(
 
 
 def parse_args() -> argparse.Namespace:
-    default_dataset = Path(__file__).resolve().parent / "samples" / "flux_sample.txt"
+    default_dataset = Path(__file__).resolve().parent / "samples" / "shortlist_sample.txt"
     parser = argparse.ArgumentParser(description="Sliding-context DMoAH training run.")
     parser.add_argument(
         "--dataset",
         type=Path,
         default=default_dataset,
-        help="Path to training corpus (default: scripts/samples/flux_sample.txt).",
+        help="Path to training corpus (default: scripts/samples/shortlist_sample.txt).",
     )
     parser.add_argument("--total-steps", type=int, default=20_000)
     parser.add_argument("--short-ctx", type=int, default=512)
@@ -278,7 +278,7 @@ def main() -> None:
         attn_small_seq_dense=args.short_ctx // 2,
         attn_force_dense_threshold=0.25,
         attn_gates=16,
-        attn_dna_enable=True,
+        attn_proto_enable=True,
         attn_quantize_int8=True,
         attn_token_sparse=True,
         attn_token_keep_ratio=0.85,

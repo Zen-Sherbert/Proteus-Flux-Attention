@@ -31,7 +31,7 @@ else:  # pragma: no cover - package execution
 
 
 def _set_alpha(model: MiniProteusLM, value: float) -> None:
-    model.set_flux_alpha(value)
+    model.set_shortlist_alpha(value)
 
 
 def run_training(

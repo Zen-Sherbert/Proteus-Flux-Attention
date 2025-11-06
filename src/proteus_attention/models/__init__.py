@@ -6,18 +6,18 @@ Re-export key transformer components so that consumers can import from
 """
 
 from .dmoah import (
-    AttentionBlock,
-    CausalDynamicAttention,
-    CausalGeneticAttention,
+    AdaptiveSparseAttentionBlock,
+    AdaptiveSparseAttention,
+    AdaptiveSparseProtoAttention,
     MLP,
     ModelConfig,
     SwitchRouter,
 )
 
 __all__ = [
-    "AttentionBlock",
-    "CausalDynamicAttention",
-    "CausalGeneticAttention",
+    "AdaptiveSparseAttentionBlock",
+    "AdaptiveSparseAttention",
+    "AdaptiveSparseProtoAttention",
     "MLP",
     "ModelConfig",
     "SwitchRouter",

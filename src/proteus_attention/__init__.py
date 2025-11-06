@@ -8,9 +8,9 @@ directly while still accessing the DMoAH internals when needed.
 """
 
 from .models.dmoah import (
-    AttentionBlock,
-    CausalDynamicAttention,
-    CausalGeneticAttention,
+    AdaptiveSparseAttentionBlock,
+    AdaptiveSparseAttention,
+    AdaptiveSparseProtoAttention,
     MLP,
     ModelConfig,
 )
@@ -20,27 +20,27 @@ from .kernels.sparse_attn import (
     get_last_backend,
     get_last_backend_info,
 )
-from .tools.chunked_flux import (
-    ChunkedFluxConfig,
-    ChunkedFluxMetrics,
-    ChunkedFluxResult,
-    ChunkedFluxRunner,
+from .tools.chunked_shortlist import (
+    ChunkedShortlistConfig,
+    ChunkedShortlistMetrics,
+    ChunkedShortlistResult,
+    ChunkedShortlistRunner,
 )
 
 __all__ = [
-    "AttentionBlock",
-    "CausalDynamicAttention",
-    "CausalGeneticAttention",
+    "AdaptiveSparseAttentionBlock",
+    "AdaptiveSparseAttention",
+    "AdaptiveSparseProtoAttention",
     "CausalGeneticMultiheadAttention",
     "MLP",
     "ModelConfig",
     "dmoah_sparse_attention",
     "get_last_backend",
     "get_last_backend_info",
-    "ChunkedFluxConfig",
-    "ChunkedFluxMetrics",
-    "ChunkedFluxResult",
-    "ChunkedFluxRunner",
+    "ChunkedShortlistConfig",
+    "ChunkedShortlistMetrics",
+    "ChunkedShortlistResult",
+    "ChunkedShortlistRunner",
     "__version__",
 ]
 

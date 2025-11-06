@@ -2,7 +2,7 @@
 """
 Adaptive context mastery trainer.
 
-Gradually increases the Flux alpha (and optional sequence length) when loss
+Gradually increases the Shortlist alpha (and optional sequence length) when loss
 improvements plateau, pushing the model toward the linear sparse regime.
 The trainer now supports mixed-precision, validation-driven adaptive jumps,
 and gradient accumulation so longer contexts remain stable as they scale.
@@ -130,7 +130,7 @@ def run_training(
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     alpha = float(max(0.0, min(1.0, alpha_start)))
-    model.set_flux_alpha(alpha)
+    model.set_shortlist_alpha(alpha)
     seq_len = base_seq_len
 
     def _build_train_batches(current_seq_len: int):
@@ -263,7 +263,7 @@ def run_training(
                     ):
                         if alpha < 1.0:
                             alpha = min(1.0, alpha + alpha_step)
-                            model.set_flux_alpha(alpha)
+                            model.set_shortlist_alpha(alpha)
                         if seq_len < max_seq_len:
                             proposed = int(seq_len * seq_growth_factor)
                             if proposed <= seq_len:
@@ -332,7 +332,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate.")
     parser.add_argument("--device", default=None, help="Device string (default auto).")
     parser.add_argument("--data", type=Path, default=None, help="Optional training text.")
-    parser.add_argument("--alpha-start", type=float, default=0.0, help="Initial Flux alpha.")
+    parser.add_argument("--alpha-start", type=float, default=0.0, help="Initial Shortlist alpha.")
     parser.add_argument("--alpha-step", type=float, default=0.1, help="Increment applied on plateau.")
     parser.add_argument("--plateau-window", type=int, default=320, help="Steps per plateau window.")
     parser.add_argument("--plateau-tol", type=float, default=0.01, help="Relative improvement threshold.")

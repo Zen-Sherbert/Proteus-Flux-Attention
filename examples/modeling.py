@@ -139,10 +139,10 @@ class MiniProteusLM(nn.Module):
             seq = torch.cat([seq, next_token.unsqueeze(-1)], dim=1)
         return seq
 
-    def set_flux_alpha(self, value: float) -> None:
-        """Override the Flux alpha on every attention block."""
+    def set_shortlist_alpha(self, value: float) -> None:
+        """Override the Shortlist alpha on every attention block."""
         for block in self.blocks:
-            block.self_attn.attention.set_flux_alpha(value)
+            block.self_attn.attention.set_shortlist_alpha(value)
 
 
 class MiniDenseLM(nn.Module):

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-FluxChunk sweep: run large-context tests (1M–10M tokens) and report latency,
+ShortlistSweep sweep: run large-context tests (1M–10M tokens) and report latency,
 throughput, retention, and VRAM for each size.
 """
 from __future__ import annotations
@@ -16,9 +16,9 @@ except Exception:  # pragma: no cover - optional
 
 import torch
 
-from proteus_attention.tools.chunked_flux import (
-    ChunkedFluxConfig,
-    ChunkedFluxRunner,
+from proteus_attention.tools.chunked_shortlist import (
+    ChunkedShortlistConfig,
+    ChunkedShortlistRunner,
     MAX_FLUX_CHUNK_TOKENS,
 )
 
@@ -27,7 +27,7 @@ def _sdpa_override(device: torch.device):
     """
     Return a context manager that forces PyTorch SDPA into a safe mode or a no-op.
 
-    We rely on the custom Flux kernels, but on some builds PyTorch may still try
+    We rely on the custom Shortlist kernels, but on some builds PyTorch may still try
     to pick Flash/efficient SDPA kernels by default.  When the backend exposes a
     context manager (torch.backends.cuda.sdp_kernel or nn_sdpa_kernel), we
     disable the Flash/MemEfficient paths.  If the signature is incompatible we
@@ -63,7 +63,7 @@ def _sdpa_override(device: torch.device):
     return nullcontext()
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="FluxChunk long-context sweep.")
+    parser = argparse.ArgumentParser(description="ShortlistSweep long-context sweep.")
     parser.add_argument("--device", default=None, help="Device string (default autodetect).")
     parser.add_argument("--d-model", type=int, default=128, help="Embedding width.")
     parser.add_argument(
@@ -76,10 +76,10 @@ def parse_args() -> argparse.Namespace:
         "--per-chunk-budget", type=int, default=4_096, help="Tokens promoted per chunk."
     )
     parser.add_argument(
-        "--flux-alpha",
+        "--shortlist-alpha",
         type=float,
         default=1.0,
-        help="Flux alpha slider (0=dense, 1=fully sparse linear shortlist).",
+        help="Shortlist alpha slider (0=dense, 1=fully sparse linear shortlist).",
     )
     parser.add_argument(
         "--ratios",
@@ -125,11 +125,11 @@ def main() -> None:
         chunk_len = min(args.chunk_len, MAX_FLUX_CHUNK_TOKENS)
         if chunk_len < args.chunk_len and not chunk_warned:
             print(
-                f"[FluxChunk] Requested chunk_len={args.chunk_len:,} exceeds "
+                f"[ShortlistSweep] Requested chunk_len={args.chunk_len:,} exceeds "
                 f"cap {MAX_FLUX_CHUNK_TOKENS:,}; using {chunk_len:,} instead."
             )
             chunk_warned = True
-        cfg = ChunkedFluxConfig(
+        cfg = ChunkedShortlistConfig(
             seq_len=seq_len,
             d_model=args.d_model,
             chunk_len=chunk_len,
@@ -143,12 +143,12 @@ def main() -> None:
             report_latency=args.report_latency and device.type == "cuda",
             progress=False,
             run_final_pass=True,
-            flux_alpha=args.flux_alpha,
+            shortlist_alpha=args.shortlist_alpha,
         )
-        runner = ChunkedFluxRunner(cfg)
+        runner = ChunkedShortlistRunner(cfg)
         print(
-            f"[FluxChunk] seq_len={seq_len:,} buffer={buffer_tokens:,} "
-            f"alpha={args.flux_alpha:.3f} device={device}"
+            f"[ShortlistSweep] seq_len={seq_len:,} buffer={buffer_tokens:,} "
+            f"alpha={args.shortlist_alpha:.3f} device={device}"
         )
         ctx = _sdpa_override(device)
         with ctx:

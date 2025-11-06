@@ -1,9 +1,10 @@
 """
-Implementation of Dynamic Mixture-of-Attention-Heads (DMoAH).
+Adaptive Sparse Mixture-of-Attention-Heads (Adaptive Sparse MoA).
 
-This module provides new `CausalDynamicAttention` and `AttentionBlock` classes
-that can be used as a drop-in replacement for the standard transformer blocks
-to enable dynamic, sparse attention head activation.
+This module exposes the `AdaptiveSparseAttention` core layer and the
+`AdaptiveSparseAttentionBlock`, which drop in for standard Transformer blocks
+while enabling adaptive sparse head activation with prototype-guided salience
+priors.
 """
 from __future__ import annotations
 
@@ -21,8 +22,8 @@ from ..kernels.sparse_attn import (
     dmoah_sparse_attention,
     get_last_backend,
     get_last_backend_info,
-    build_flux_candidates,
-    build_packed_flux_candidates,
+    build_shortlist_candidates,
+    build_packed_shortlist_candidates,
     _record_backend,
     _pack_active_rows,
     TRITON_SEQ_LEN_LIMIT,
@@ -108,7 +109,7 @@ def _build_norm(config: ModelConfig) -> nn.Module:
 
 
 class MLP(nn.Module):
-    """Simple feed-forward block used by the AttentionBlock."""
+    """Simple feed-forward block used by the AdaptiveSparseAttentionBlock."""
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
@@ -133,7 +134,7 @@ class SwitchRouter(nn.Module):
     """
     Lightweight router that produces per-token gate probabilities over heads.
 
-    The interface mirrors the subset used by CausalDynamicAttention: the module
+    The interface mirrors the subset used by AdaptiveSparseAttention: the module
     returns a tuple of (indices, scores, probabilities), where the first two
     entries are provided for API compatibility but are not consumed.
     """
@@ -164,7 +165,7 @@ def _get_causal_mask(target_len: int, device: torch.device, dtype: torch.dtype) 
     return mask
 
 
-class CausalDynamicAttention(nn.Module):
+class AdaptiveSparseAttention(nn.Module):
     """
     Dynamic Mixture-of-Attention-Heads (DMoAH).
 
@@ -292,19 +293,28 @@ class CausalDynamicAttention(nn.Module):
             getattr(config, "attn_linear_piece_anchor_frac", 0.3) or 0.3)
         piece_local = max(0.0, min(1.0, piece_local))
         piece_anchor = max(0.0, min(1.0, piece_anchor))
-        piece_dna = float(getattr(config, "attn_linear_piece_dna_frac", max(
-            0.0, 1.0 - piece_local - piece_anchor)))
-        piece_dna = max(0.0, min(1.0, piece_dna))
-        total_piece = piece_local + piece_anchor + piece_dna
+        piece_proto = float(
+            getattr(
+                config,
+                "attn_linear_piece_proto_frac",
+                getattr(
+                    config,
+                    "attn_linear_piece_proto_frac",
+                    max(0.0, 1.0 - piece_local - piece_anchor),
+                ),
+            )
+        )
+        piece_proto = max(0.0, min(1.0, piece_proto))
+        total_piece = piece_local + piece_anchor + piece_proto
         if total_piece <= 0.0:
-            piece_local, piece_anchor, piece_dna = 1.0, 0.0, 0.0
+            piece_local, piece_anchor, piece_proto = 1.0, 0.0, 0.0
             total_piece = 1.0
         piece_local /= total_piece
         piece_anchor /= total_piece
-        piece_dna = max(0.0, 1.0 - piece_local - piece_anchor)
+        piece_proto = max(0.0, 1.0 - piece_local - piece_anchor)
         self.linear_piece_local_frac = piece_local
         self.linear_piece_anchor_frac = piece_anchor
-        self.linear_piece_dna_frac = piece_dna
+        self.linear_piece_proto_frac = piece_proto
         window_hint = int(getattr(config, "attn_linear_window",
                           self.linear_L_base) or self.linear_L_base)
         if window_hint <= 0:
@@ -331,26 +341,28 @@ class CausalDynamicAttention(nn.Module):
         self.linear_policy_tokens = tokens
         self.linear_use_anchors = any(name in tokens for name in {
                                       "anchors", "anchor", "global"})
-        self.linear_use_dna = any(
-            name in tokens for name in {"dna", "semantic"})
+        self.linear_use_proto = any(
+            name in tokens
+            for name in {"proto", "prototype", "semantic", "dna"}
+        )
         self.linear_use_local = any(name in tokens for name in {"local", "window"}) or not (
-            self.linear_use_anchors or self.linear_use_dna)
+            self.linear_use_anchors or self.linear_use_proto)
         if not self.linear_use_local:
             self.linear_piece_local_frac = 0.0
         if not self.linear_use_anchors:
             self.linear_piece_anchor_frac = 0.0
-        if not self.linear_use_dna:
-            self.linear_piece_dna_frac = 0.0
+        if not self.linear_use_proto:
+            self.linear_piece_proto_frac = 0.0
         piece_sum = self.linear_piece_local_frac + \
-            self.linear_piece_anchor_frac + self.linear_piece_dna_frac
+            self.linear_piece_anchor_frac + self.linear_piece_proto_frac
         if piece_sum <= 0.0:
             self.linear_piece_local_frac = 1.0
             self.linear_piece_anchor_frac = 0.0
-            self.linear_piece_dna_frac = 0.0
+            self.linear_piece_proto_frac = 0.0
         else:
             self.linear_piece_local_frac /= piece_sum
             self.linear_piece_anchor_frac /= piece_sum
-            self.linear_piece_dna_frac = max(
+            self.linear_piece_proto_frac = max(
                 0.0, 1.0 - self.linear_piece_local_frac - self.linear_piece_anchor_frac)
         self._linear_runtime: Optional[dict] = None
         self._linear_runtime_seq_len: Optional[int] = None
@@ -429,7 +441,7 @@ class CausalDynamicAttention(nn.Module):
             gate_to_head, num_classes=self.h_total).to(torch.float32)
         self.register_buffer("gate_to_head_onehot", one_hot, persistent=False)
 
-        self._flux_alpha_override: Optional[float] = None
+        self._shortlist_alpha_override: Optional[float] = None
         # --- Standard layers ---
         self.qkv = nn.Linear(self.d_model, 3 * self.d_model, bias=self.bias)
         self.proj = nn.Linear(self.d_model, self.d_model, bias=self.bias)
@@ -445,29 +457,29 @@ class CausalDynamicAttention(nn.Module):
         self._latency_ema: Optional[float] = None
         self.track_latency: bool = bool(
             getattr(config, "attn_track_latency", True))
-        self.dna_enabled = bool(getattr(config, "attn_dna_enable", False))
-        self.dna_decay = float(getattr(config, "attn_dna_decay", 0.97))
-        self.dna_threshold = float(getattr(config, "attn_dna_threshold", 0.25))
-        self.dna_blend = float(getattr(config, "attn_dna_blend", 0.6))
-        self.dna_temp = float(max(getattr(config, "attn_dna_temp", 0.2), 1e-3))
-        self.dna_usage_boost = float(
-            max(getattr(config, "attn_dna_usage_boost", 0.0), 0.0))
-        self.dna_init_scale = float(
-            getattr(config, "attn_dna_init_scale", 0.02))
-        if self.dna_enabled:
-            proto = torch.randn(self.attn_gates, self.d_model,
-                                dtype=torch.float32) * self.dna_init_scale
+        self.proto_enabled = bool(getattr(config, "attn_proto_enable", False))
+        self.proto_decay = float(getattr(config, "attn_proto_decay", 0.97))
+        self.proto_threshold = float(getattr(config, "attn_proto_threshold", 0.25))
+        self.proto_blend = float(getattr(config, "attn_proto_blend", 0.6))
+        self.proto_temp = float(max(getattr(config, "attn_proto_temp", 0.2), 1e-3))
+        self.proto_usage_boost = float(
+            max(getattr(config, "attn_proto_usage_boost", 0.0), 0.0))
+        self.proto_init_scale = float(
+            getattr(config, "attn_proto_init_scale", 0.02))
+        if self.proto_enabled:
+            proto_vecs = torch.randn(
+                self.attn_gates, self.d_model, dtype=torch.float32
+            ) * self.proto_init_scale
             usage = torch.zeros(self.attn_gates, dtype=torch.float32)
             confidence = torch.zeros(self.attn_gates, dtype=torch.float32)
-            self.register_buffer("dna_proto", proto)
-            self.register_buffer("dna_usage_ema", usage)
-            self.register_buffer("dna_confidence", confidence)
+            self.register_buffer("routing_prototypes", proto_vecs)
+            self.register_buffer("routing_usage_ema", usage)
+            self.register_buffer("routing_confidence", confidence)
         else:
-            self.dna_proto = None  # type: ignore[attr-defined, assignment]
-            self.dna_usage_ema = None  # type: ignore[attr-defined, assignment]
-            # type: ignore[attr-defined, assignment]
-            self.dna_confidence = None
-        self._last_dna_stats: Optional[dict] = None
+            self.routing_prototypes = None  # type: ignore[attr-defined, assignment]
+            self.routing_usage_ema = None  # type: ignore[attr-defined, assignment]
+            self.routing_confidence = None  # type: ignore[attr-defined, assignment]
+        self._last_proto_stats: Optional[dict] = None
         self.token_sparse = bool(getattr(config, "attn_token_sparse", False))
         keep_ratio = float(
             getattr(config, "attn_token_keep_ratio", 1.0) or 1.0)
@@ -501,7 +513,7 @@ class CausalDynamicAttention(nn.Module):
         self._last_token_mask: Optional[torch.Tensor] = None
         self._last_token_blend: Optional[torch.Tensor] = None
         self._last_token_similarity: Optional[torch.Tensor] = None
-        self._last_flux_backend_info: Optional[Dict[str, object]] = None
+        self._last_shortlist_backend_info: Optional[Dict[str, object]] = None
         self._last_batch_size: Optional[int] = None
 
     @staticmethod
@@ -564,71 +576,71 @@ class CausalDynamicAttention(nn.Module):
         return torch.clamp((idx * heads) // max(gates, 1), 0, heads - 1)
 
     def _route_tokens(self, x: torch.Tensor) -> torch.Tensor:
-        """Blend DNA similarity routing with the learned router."""
+        """Blend prototype-guided routing with the learned router."""
         _, _, router_probs = self.head_router(x)
         gate_probs = router_probs.to(torch.float32)
-        dna_stats: Optional[dict] = None
-        dna_similarity: Optional[torch.Tensor] = None
-        dna_blend_scalar: Optional[torch.Tensor] = None
-        if self.dna_enabled and self.dna_proto is not None:
-            proto = self.dna_proto
+        proto_stats: Optional[dict] = None
+        proto_similarity: Optional[torch.Tensor] = None
+        proto_blend_scalar: Optional[torch.Tensor] = None
+        if self.proto_enabled and self.routing_prototypes is not None:
+            proto = self.routing_prototypes
             token_norm = F.normalize(x.detach().to(
                 torch.float32), dim=-1, eps=1e-6)
             proto_norm = F.normalize(
                 proto.to(token_norm.dtype), dim=-1, eps=1e-6)
             sims = torch.matmul(token_norm, proto_norm.transpose(0, 1))
-            dna_similarity, _ = sims.max(dim=-1)
-            dna_probs = F.softmax(sims / self.dna_temp, dim=-1)
+            proto_similarity, _ = sims.max(dim=-1)
+            proto_probs = F.softmax(sims / self.proto_temp, dim=-1)
             blend_scalar = torch.clamp(
-                (dna_similarity - self.dna_threshold) /
-                max(1e-6, 1.0 - self.dna_threshold),
+                (proto_similarity - self.proto_threshold) /
+                max(1e-6, 1.0 - self.proto_threshold),
                 0.0,
                 1.0,
             )
-            if self.dna_confidence is not None:
-                confidence = (self.dna_confidence.view(
+            if self.routing_confidence is not None:
+                confidence = (self.routing_confidence.view(
                     1, 1, -1) + 1e-6).to(torch.float32)
-                dna_probs = dna_probs * confidence
-                dna_probs = dna_probs / \
-                    dna_probs.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-            dna_probs = dna_probs.to(gate_probs.dtype)
-            blend = self.dna_blend * \
+                proto_probs = proto_probs * confidence
+                proto_probs = proto_probs / \
+                    proto_probs.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            proto_probs = proto_probs.to(gate_probs.dtype)
+            blend = self.proto_blend * \
                 blend_scalar.unsqueeze(-1).to(gate_probs.dtype)
-            gate_probs = gate_probs * (1.0 - blend) + dna_probs * blend
+            gate_probs = gate_probs * (1.0 - blend) + proto_probs * blend
             usage_bias = None
-            if self.dna_usage_boost > 0.0 and self.dna_usage_ema is not None:
-                usage = self.dna_usage_ema + 1e-6
+            if self.proto_usage_boost > 0.0 and self.routing_usage_ema is not None:
+                usage = self.routing_usage_ema + 1e-6
                 usage_bias = torch.softmax(-usage, dim=0).to(gate_probs.dtype)
                 gate_probs = gate_probs + usage_bias.view(1, 1, -1) * (
                     (1.0 - blend_scalar).unsqueeze(-1).to(gate_probs.dtype) *
-                    self.dna_usage_boost
+                    self.proto_usage_boost
                 )
             gate_probs = gate_probs.clamp_min(0.0)
             gate_probs = gate_probs / \
                 gate_probs.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-            dna_stats = {
-                "max_sim_mean": float(dna_similarity.mean().item()),
+            proto_stats = {
+                "max_sim_mean": float(proto_similarity.mean().item()),
                 "blend_mean": float(blend_scalar.mean().item()),
                 "active_tokens": int((blend_scalar > 0).sum().item()),
             }
             if usage_bias is not None:
                 entropy = - \
                     (usage_bias * usage_bias.clamp_min(1e-9).log()).sum()
-                dna_stats["usage_bias_entropy"] = float(entropy.item())
-            dna_blend_scalar = blend_scalar.detach()
-        self._last_dna_stats = dna_stats
-        if dna_similarity is not None:
-            self._last_token_similarity = dna_similarity.detach().to(torch.float32)
+                proto_stats["usage_bias_entropy"] = float(entropy.item())
+            proto_blend_scalar = blend_scalar.detach()
+        self._last_proto_stats = proto_stats
+        if proto_similarity is not None:
+            self._last_token_similarity = proto_similarity.detach().to(torch.float32)
         else:
             self._last_token_similarity = None
-        if dna_blend_scalar is not None:
-            self._last_token_blend = dna_blend_scalar.to(torch.float32)
+        if proto_blend_scalar is not None:
+            self._last_token_blend = proto_blend_scalar.to(torch.float32)
         else:
             self._last_token_blend = None
         return gate_probs
 
-    def _update_dna(self, token_feats: torch.Tensor, gate_probs: torch.Tensor) -> None:
-        if not (self.dna_enabled and self.dna_proto is not None and self.dna_usage_ema is not None and self.dna_confidence is not None):
+    def _update_routing_prototypes(self, token_feats: torch.Tensor, gate_probs: torch.Tensor) -> None:
+        if not (self.proto_enabled and self.routing_prototypes is not None and self.routing_usage_ema is not None and self.routing_confidence is not None):
             return
         with torch.no_grad():
             feats = token_feats.detach().to(torch.float32)
@@ -640,20 +652,20 @@ class CausalDynamicAttention(nn.Module):
             if not mask.any():
                 return
             weighted = flat_probs.transpose(0, 1) @ flat_feats
-            mean = torch.zeros_like(self.dna_proto, dtype=flat_feats.dtype)
+            mean = torch.zeros_like(self.routing_prototypes, dtype=flat_feats.dtype)
             mean[mask] = weighted[mask] / counts[mask].unsqueeze(-1)
-            decay = self.dna_decay
-            proto = self.dna_proto
+            decay = self.proto_decay
+            proto = self.routing_prototypes
             proto[mask] = proto[mask] * decay + mean[mask].to(proto.dtype) * (1.0 - decay)
-            usage = self.dna_usage_ema
+            usage = self.routing_usage_ema
             usage.mul_(decay)
             usage[mask] += counts[mask] * (1.0 - decay)
-            confidence = self.dna_confidence
+            confidence = self.routing_confidence
             confidence.mul_(decay)
             confidence[mask] += (1.0 - decay)
-            if self._last_dna_stats is None:
-                self._last_dna_stats = {}
-            self._last_dna_stats["updated_gates"] = int(mask.sum().item())
+            if self._last_proto_stats is None:
+                self._last_proto_stats = {}
+            self._last_proto_stats["updated_gates"] = int(mask.sum().item())
 
     def _causal_mask(self, target_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """Return (and cache) a causal mask of size (target_len, target_len)."""
@@ -780,9 +792,9 @@ class CausalDynamicAttention(nn.Module):
         ratio = max(min_ratio, min(base, ratio))
         return float(ratio)
 
-    def _get_flux_alpha(self, seq_len: int) -> float:
-        if self._flux_alpha_override is not None:
-            return float(max(0.0, min(1.0, self._flux_alpha_override)))
+    def _get_shortlist_alpha(self, seq_len: int) -> float:
+        if self._shortlist_alpha_override is not None:
+            return float(max(0.0, min(1.0, self._shortlist_alpha_override)))
         seq_len = int(max(1, seq_len))
         low = max(1, int(self.seq_low))
         high = max(low + 1, int(self.linear_switch_ctx)
@@ -793,9 +805,9 @@ class CausalDynamicAttention(nn.Module):
             return 1.0
         return float((seq_len - low) / (high - low))
 
-    def set_flux_alpha(self, value: float) -> None:
-        """Externally override the flux slider (0=dense, 1=linear)."""
-        self._flux_alpha_override = float(max(0.0, min(1.0, value)))
+    def set_shortlist_alpha(self, value: float) -> None:
+        """Externally override the shortlist slider (0=dense, 1=linear)."""
+        self._shortlist_alpha_override = float(max(0.0, min(1.0, value)))
         self._linear_runtime = None
         self._linear_runtime_seq_len = None
 
@@ -840,41 +852,41 @@ class CausalDynamicAttention(nn.Module):
         dense_weights = (
             0.85 if self.linear_use_local else 0.0,
             0.10 if self.linear_use_anchors else 0.0,
-            0.05 if self.linear_use_dna else 0.0,
+            0.05 if self.linear_use_proto else 0.0,
         )
         target_weights = (
             self.linear_piece_local_frac if self.linear_use_local else 0.0,
             self.linear_piece_anchor_frac if self.linear_use_anchors else 0.0,
-            self.linear_piece_dna_frac if self.linear_use_dna else 0.0,
+            self.linear_piece_proto_frac if self.linear_use_proto else 0.0,
         )
         weight_local = (1.0 - alpha) * \
             dense_weights[0] + alpha * target_weights[0]
         weight_anchor = (1.0 - alpha) * \
             dense_weights[1] + alpha * target_weights[1]
-        weight_dna = (1.0 - alpha) * \
+        weight_proto = (1.0 - alpha) * \
             dense_weights[2] + alpha * target_weights[2]
-        total_weight = weight_local + weight_anchor + weight_dna
+        total_weight = weight_local + weight_anchor + weight_proto
         if total_weight <= 0.0:
             weight_local = 1.0
             weight_anchor = 0.0
-            weight_dna = 0.0
+            weight_proto = 0.0
             total_weight = 1.0
         weight_local /= total_weight
         weight_anchor /= total_weight
-        weight_dna = max(0.0, 1.0 - weight_local - weight_anchor)
+        weight_proto = max(0.0, 1.0 - weight_local - weight_anchor)
 
         local_cap = int(round(eff * self.linear_piece_local_frac)
                         ) if self.linear_use_local else 0
         anchor_cap = int(round(eff * self.linear_piece_anchor_frac)
                          ) if self.linear_use_anchors else 0
-        dna_cap = int(round(eff * self.linear_piece_dna_frac)
-                      ) if self.linear_use_dna else 0
+        proto_cap = int(round(eff * self.linear_piece_proto_frac)
+                      ) if self.linear_use_proto else 0
         local_cap = int(round(eff * weight_local)
                         ) if self.linear_use_local else 0
         anchor_cap = int(round(eff * weight_anchor)
                          ) if self.linear_use_anchors else 0
-        dna_cap = int(round(eff * weight_dna)) if self.linear_use_dna else 0
-        caps = [local_cap, anchor_cap, dna_cap]
+        proto_cap = int(round(eff * weight_proto)) if self.linear_use_proto else 0
+        caps = [local_cap, anchor_cap, proto_cap]
         total_caps = sum(caps)
         if total_caps > eff and total_caps > 0:
             scale_down = eff / total_caps
@@ -885,7 +897,7 @@ class CausalDynamicAttention(nn.Module):
         for idx in order:
             if remaining <= 0:
                 break
-            if (idx == 0 and not self.linear_use_local) or (idx == 1 and not self.linear_use_anchors) or (idx == 2 and not self.linear_use_dna):
+            if (idx == 0 and not self.linear_use_local) or (idx == 1 and not self.linear_use_anchors) or (idx == 2 and not self.linear_use_proto):
                 continue
             caps[idx] += 1
             remaining -= 1
@@ -897,22 +909,22 @@ class CausalDynamicAttention(nn.Module):
                 caps[0] = min(window, max(1, eff // 4))
         if self.linear_use_anchors and caps[1] < 0:
             caps[1] = 0
-        if self.linear_use_dna and caps[2] < 0:
+        if self.linear_use_proto and caps[2] < 0:
             caps[2] = 0
-        local_cap, anchor_cap, dna_cap = caps
+        local_cap, anchor_cap, proto_cap = caps
         return {
             "effective_L": eff,
             "local_cap": max(0, int(local_cap)),
             "anchor_cap": max(0, int(anchor_cap)),
-            "dna_cap": max(0, int(dna_cap)),
+            "proto_cap": max(0, int(proto_cap)),
             "window": max(1, int(window)),
-            "flux_alpha": float(alpha),
+            "shortlist_alpha": float(alpha),
         }
 
     def _prepare_linear_runtime(self, seq_len: int, batch_size: Optional[int]) -> dict:
         if self._linear_runtime is not None and self._linear_runtime_seq_len == seq_len:
             return self._linear_runtime
-        alpha = self._get_flux_alpha(seq_len)
+        alpha = self._get_shortlist_alpha(seq_len)
         params = self._compute_effective_linear_params(
             seq_len, batch_size, alpha)
         eff = params["effective_L"]
@@ -922,10 +934,10 @@ class CausalDynamicAttention(nn.Module):
             "effective_L": eff,
             "local_cap": params["local_cap"],
             "anchor_cap": params["anchor_cap"],
-            "dna_cap": params["dna_cap"],
+            "proto_cap": params["proto_cap"],
             "window": params["window"],
             "anchor_stride": self.linear_anchor_stride,
-            "flux_alpha": params["flux_alpha"],
+            "shortlist_alpha": params["shortlist_alpha"],
         }
         self._linear_runtime = runtime
         self._linear_runtime_seq_len = seq_len
@@ -963,7 +975,7 @@ class CausalDynamicAttention(nn.Module):
                 return "linear"
         return "subquad"
 
-    def _run_flux_attention(
+    def _run_shortlist_attention(
         self,
         q_heads: torch.Tensor,
         k_heads: torch.Tensor,
@@ -975,7 +987,7 @@ class CausalDynamicAttention(nn.Module):
         head_indices: torch.Tensor,
         causal_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute Flux attention per head using fused shortlist candidates."""
+        """Compute Shortlist attention per head using fused shortlist candidates."""
 
         head_idx, token_idx, row_offsets, _ = packed
         active_heads = q_heads.size(0)
@@ -987,10 +999,10 @@ class CausalDynamicAttention(nn.Module):
             seq_len, getattr(self, "_last_batch_size", None))
         eff_L = runtime["effective_L"]
 
-        alpha = runtime.get("flux_alpha", self._get_flux_alpha(seq_len))
+        alpha = runtime.get("shortlist_alpha", self._get_shortlist_alpha(seq_len))
         row_batch_ids: Optional[torch.Tensor]
-        dna_scores_all: Optional[torch.Tensor]
-        if self.linear_use_dna and self._last_token_similarity is not None:
+        proto_scores_all: Optional[torch.Tensor]
+        if self.linear_use_proto and self._last_token_similarity is not None:
             row_counts = (row_offsets[1:] - row_offsets[:-1]).to(torch.long)
             head_range = torch.arange(
                 active_heads, device=row_offsets.device, dtype=torch.long
@@ -1001,12 +1013,12 @@ class CausalDynamicAttention(nn.Module):
             row_batch_ids = (global_heads // self.h_total).to(
                 device=token_idx.device, dtype=torch.long
             )
-            dna_scores_all = self._last_token_similarity
+            proto_scores_all = self._last_token_similarity
         else:
             row_batch_ids = None
-            dna_scores_all = None
+            proto_scores_all = None
 
-        flux_candidates, flux_lengths = build_packed_flux_candidates(
+        shortlist_candidates, shortlist_lengths = build_packed_shortlist_candidates(
             token_idx,
             row_batch_ids,
             seq_len,
@@ -1015,13 +1027,13 @@ class CausalDynamicAttention(nn.Module):
             anchor_stride=runtime["anchor_stride"],
             use_local=self.linear_use_local,
             use_anchors=self.linear_use_anchors,
-            dna_scores=dna_scores_all,
+            proto_scores=proto_scores_all,
             local_cap=runtime["local_cap"],
             anchor_cap=runtime["anchor_cap"],
-            dna_cap=runtime["dna_cap"],
+            proto_cap=runtime["proto_cap"],
         )
 
-        self._last_flux_backend_info = None
+        self._last_shortlist_backend_info = None
         attn_sparse = dmoah_sparse_attention(
             q_heads,
             k_heads,
@@ -1031,14 +1043,14 @@ class CausalDynamicAttention(nn.Module):
             dropout_p=dropout_p,
             training=self.training,
             prepacked=packed,
-            flux_candidates=flux_candidates,
-            flux_lengths=flux_lengths,
+            shortlist_candidates=shortlist_candidates,
+            shortlist_lengths=shortlist_lengths,
         )
-        self._last_flux_backend_info = get_last_backend_info()
+        self._last_shortlist_backend_info = get_last_backend_info()
         if self._last_sparse_state is not None:
-            self._last_sparse_state["flux_alpha"] = float(alpha)
+            self._last_sparse_state["shortlist_alpha"] = float(alpha)
         if self.last_head_stats is not None:
-            self.last_head_stats["flux_alpha"] = float(alpha)
+            self.last_head_stats["shortlist_alpha"] = float(alpha)
         return attn_sparse
 
     def _quantize_per_head_int8(self, tensor: torch.Tensor, ema_buffer: str) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1175,7 +1187,7 @@ class CausalDynamicAttention(nn.Module):
         self._last_token_importance = None
         self._last_token_mask = None
         self._last_token_blend = None
-        if not self.dna_enabled:
+        if not self.proto_enabled:
             self._last_token_similarity = None
 
         start_time: Optional[float] = None
@@ -1483,7 +1495,7 @@ class CausalDynamicAttention(nn.Module):
                     mode_label = "sparse"
                     use_quant = False
                     if mode_now == "linear":
-                        attn_sparse = self._run_flux_attention(
+                        attn_sparse = self._run_shortlist_attention(
                             q_comp,
                             k_comp,
                             v_comp,
@@ -1494,10 +1506,10 @@ class CausalDynamicAttention(nn.Module):
                             active_head_indices,
                             causal_mask,
                         )
-                        backend_info = self._last_flux_backend_info or get_last_backend_info()
-                        backend_name = str(backend_info.get("name", "flux"))
-                        mode_label = "flux"
-                        exec_mode_label = "flux"
+                        backend_info = self._last_shortlist_backend_info or get_last_backend_info()
+                        backend_name = str(backend_info.get("name", "shortlist"))
+                        mode_label = "shortlist"
+                        exec_mode_label = "shortlist"
                     else:
                         use_quant = bool(
                             self.quantize_sparse_int8 and not self.training and not long_context
@@ -1569,7 +1581,7 @@ class CausalDynamicAttention(nn.Module):
                         sparse_state["linear_window"] = int(self.linear_window)
                         sparse_state["linear_anchor_stride"] = int(
                             self.linear_anchor_stride)
-                        backend_info = self._last_flux_backend_info or get_last_backend_info()
+                        backend_info = self._last_shortlist_backend_info or get_last_backend_info()
                         backend_name = backend_info.get("name") if isinstance(
                             backend_info, dict) else None
                         if backend_name is not None:
@@ -1629,7 +1641,7 @@ class CausalDynamicAttention(nn.Module):
             self.last_head_stats["linear_window"] = int(self.linear_window)
             self.last_head_stats["linear_anchor_stride"] = int(
                 self.linear_anchor_stride)
-            backend_info = self._last_flux_backend_info or get_last_backend_info()
+            backend_info = self._last_shortlist_backend_info or get_last_backend_info()
             backend_name = backend_info.get("name") if isinstance(
                 backend_info, dict) else None
             if backend_name is not None:
@@ -1639,10 +1651,14 @@ class CausalDynamicAttention(nn.Module):
                 if isinstance(details, dict):
                     for key, value in details.items():
                         self.last_head_stats[f"linear_shortlist_{key}"] = value
-        if self._last_dna_stats:
-            self.last_head_stats["dna"] = dict(self._last_dna_stats)
+        if self._last_proto_stats:
+            proto_stats = dict(self._last_proto_stats)
+            self.last_head_stats["proto"] = proto_stats
+            # Preserve legacy key for older log parsers.
+            if "dna" not in self.last_head_stats:
+                self.last_head_stats["dna"] = dict(proto_stats)
         self.last_router_reg = router_reg
-        self._update_dna(x, gate_probs)
+        self._update_routing_prototypes(x, gate_probs)
 
         _finalize_latency(exec_mode_label)
         if self.linear_mem_budget_mb and device.type == "cuda":
@@ -1660,21 +1676,21 @@ class CausalDynamicAttention(nn.Module):
         return y
 
 
-class CausalGeneticAttention(CausalDynamicAttention):
-    """CausalDynamicAttention with DNA-based priors enabled by default."""
+class AdaptiveSparseProtoAttention(AdaptiveSparseAttention):
+    """AdaptiveSparseAttention with prototype-based routing priors enabled."""
 
     def __init__(self, config: ModelConfig):
-        if not getattr(config, "attn_dna_enable", False):
+        if not getattr(config, "attn_proto_enable", False):
             try:
-                setattr(config, "attn_dna_enable", True)
+                setattr(config, "attn_proto_enable", True)
             except Exception:
                 pass
         super().__init__(config)
 
 
-class AttentionBlock(nn.Module):
+class AdaptiveSparseAttentionBlock(nn.Module):
     """
-    The new Transformer block that uses CausalDynamicAttention.
+    The new Transformer block that uses AdaptiveSparseAttention.
     This is a drop-in replacement for the original `Block`.
     """
 
@@ -1683,10 +1699,10 @@ class AttentionBlock(nn.Module):
         self.ln1 = _build_norm(config)
 
         # --- USE THE NEW ATTENTION MODULE ---
-        if bool(getattr(config, "attn_dna_enable", False)):
-            self.attn = CausalGeneticAttention(config)
+        if bool(getattr(config, "attn_proto_enable", False)):
+            self.attn = AdaptiveSparseProtoAttention(config)
         else:
-            self.attn = CausalDynamicAttention(config)
+            self.attn = AdaptiveSparseAttention(config)
 
         self.ln2 = _build_norm(config)
 

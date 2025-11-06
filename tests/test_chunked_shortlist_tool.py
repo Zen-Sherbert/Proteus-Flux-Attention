@@ -1,14 +1,14 @@
 import torch
 
-from proteus_attention.tools.chunked_flux import (
-    ChunkedFluxConfig,
-    ChunkedFluxRunner,
+from proteus_attention.tools.chunked_shortlist import (
+    ChunkedShortlistConfig,
+    ChunkedShortlistRunner,
 )
 
 
-def test_chunked_flux_cpu_small_run():
+def test_chunked_shortlist_cpu_small_run():
     device = torch.device("cpu")
-    config = ChunkedFluxConfig(
+    config = ChunkedShortlistConfig(
         seq_len=64,
         d_model=32,
         chunk_len=16,
@@ -23,7 +23,7 @@ def test_chunked_flux_cpu_small_run():
         progress=False,
         run_final_pass=True,
     )
-    runner = ChunkedFluxRunner(config)
+    runner = ChunkedShortlistRunner(config)
     result = runner.run()
 
     assert result.keep_indices.numel() <= config.buffer_tokens
@@ -42,12 +42,12 @@ def test_chunked_flux_cpu_small_run():
         assert isinstance(result.backend_info, dict)
 
 
-def test_chunked_flux_custom_sequence_respects_input():
+def test_chunked_shortlist_custom_sequence_respects_input():
     device = torch.device("cpu")
     seq_len = 48
     d_model = 16
     sequence = torch.randn(1, seq_len, d_model)
-    config = ChunkedFluxConfig(
+    config = ChunkedShortlistConfig(
         seq_len=seq_len,
         d_model=d_model,
         chunk_len=12,
@@ -62,7 +62,7 @@ def test_chunked_flux_custom_sequence_respects_input():
         progress=False,
         run_final_pass=False,
     )
-    runner = ChunkedFluxRunner(config)
+    runner = ChunkedShortlistRunner(config)
     result = runner.run(sequence=sequence)
 
     gathered = sequence[:, result.keep_indices]

@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """
-Synthetic checks for the chunked Flux pipeline.
+Synthetic checks for the chunked Shortlist pipeline.
 
 The helpers here exercise the sentinel/needle recall behaviour, the effect of
-adding an auxiliary DNA-style importance boost, and the ordering guarantees that
+adding an auxiliary Proto-style importance boost, and the ordering guarantees that
 keep indices remain monotonic (mirroring the RoPE position story).
 """
 from __future__ import annotations
@@ -21,11 +21,11 @@ THIS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = THIS_DIR.parent
 SRC_ROOT = PROJECT_ROOT / "src"
 SAMPLES_DIR = THIS_DIR / "samples"
-DEFAULT_SAMPLE_FILE = SAMPLES_DIR / "flux_sample.txt"
+DEFAULT_SAMPLE_FILE = SAMPLES_DIR / "shortlist_sample.txt"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from proteus_attention.tools.chunked_flux import (
+from proteus_attention.tools.chunked_shortlist import (
     _chunk_iter,
     _finalise_indices,
     _select_top_tokens,
@@ -59,7 +59,7 @@ def _run_pipeline(
     buffer_tokens: int,
     sentinel_idx: Union[int, Sequence[int]],
     base_boost: Union[float, torch.Tensor, dict[int, float]],
-    dna_boost: Union[float, dict[int, float]] = 0.0,
+    proto_boost: Union[float, dict[int, float]] = 0.0,
     rng_seed: int = 123,
     adaptive_margin: Optional[float] = None,
     max_chunk_extra: int = 8,
@@ -91,8 +91,8 @@ def _run_pipeline(
                 sentinel_present = True
                 pos = idx - start
                 importance[0, pos] += _boost_for(idx, base_boost)
-                if dna_boost:
-                    importance[0, pos] += _boost_for(idx, dna_boost)
+                if proto_boost:
+                    importance[0, pos] += _boost_for(idx, proto_boost)
         if not sentinel_present:
             # Create a couple of distractors so the sentinel has competition.
             importance[0, torch.randint(0, current_len, (2,))] += 0.25
@@ -238,7 +238,7 @@ def _sample_text_demo(args: argparse.Namespace) -> None:
         buffer_tokens=buffer_tokens,
         sentinel_idx=sentinel_indices,
         base_boost=5.0,
-        dna_boost=1.0,
+        proto_boost=1.0,
     )
     keep_indices = keep_indices.to(torch.long)
     retained_flags = {
@@ -267,7 +267,7 @@ def _needle_cluster_test(args: argparse.Namespace) -> None:
         buffer_tokens=max(args.buffer_tokens, len(sentinels)),
         sentinel_idx=sentinels,
         base_boost=3.0,
-        dna_boost=0.0,
+        proto_boost=0.0,
     )
     retained = sum(bool((keep_indices == idx).any()) for idx in sentinels)
     recall = retained / len(sentinels)
@@ -286,7 +286,7 @@ def _needle_cluster_test(args: argparse.Namespace) -> None:
             buffer_tokens=max(args.buffer_tokens, len(sentinels)),
             sentinel_idx=sentinels,
             base_boost=3.0,
-            dna_boost=0.0,
+            proto_boost=0.0,
             adaptive_margin=adaptive_margin,
             max_chunk_extra=args.cluster_max_extra,
         )
@@ -316,7 +316,7 @@ def _fading_signal_test(
                 buffer_tokens=args.buffer_tokens,
                 sentinel_idx=sentinel_idx,
                 base_boost=boost,
-                dna_boost=0.0,
+                proto_boost=0.0,
                 rng_seed=seed,
             )
             if bool((keep_indices == sentinel_idx).any()):
@@ -337,7 +337,7 @@ def _jigsaw_puzzle_test(args: argparse.Namespace) -> None:
         buffer_tokens=max(args.buffer_tokens, len(sentinels)),
         sentinel_idx=sentinels,
         base_boost=4.0,
-        dna_boost=0.5,
+        proto_boost=0.5,
     )
     both = all(bool((keep_indices == idx).any()) for idx in sentinels)
     print(f"[jigsaw] both clues retained? {both} | keep_indices={keep_indices.tolist()}")
@@ -428,15 +428,15 @@ def run_checks(args: argparse.Namespace) -> None:
         buffer_tokens=buffer_tokens,
         sentinel_idx=sentinel_idx,
         base_boost=5.0,
-        dna_boost=0.0,
+        proto_boost=0.0,
     )
     if args.verbose:
         print(_format_logs(logs))
     retained = bool((keep_indices == sentinel_idx).any())
     print(f"retained sentinel? {retained} | keep_indices={keep_indices.tolist()}")
 
-    print("\n=== DNA teleportation hypothesis ===")
-    keep_no_dna, logs_no_dna = _run_pipeline(
+    print("\n=== Proto teleportation hypothesis ===")
+    keep_no_proto, logs_no_proto = _run_pipeline(
         seq_len=seq_len,
         d_model=args.d_model,
         chunk_len=chunk_len,
@@ -444,9 +444,9 @@ def run_checks(args: argparse.Namespace) -> None:
         buffer_tokens=buffer_tokens,
         sentinel_idx=sentinel_idx,
         base_boost=-0.2,
-        dna_boost=0.0,
+        proto_boost=0.0,
     )
-    keep_with_dna, logs_with_dna = _run_pipeline(
+    keep_with_proto, logs_with_proto = _run_pipeline(
         seq_len=seq_len,
         d_model=args.d_model,
         chunk_len=chunk_len,
@@ -454,17 +454,17 @@ def run_checks(args: argparse.Namespace) -> None:
         buffer_tokens=buffer_tokens,
         sentinel_idx=sentinel_idx,
         base_boost=-0.2,
-        dna_boost=1.0,
+        proto_boost=1.0,
     )
     if args.verbose:
-        print("-- without DNA boost --")
-        print(_format_logs(logs_no_dna))
-        print("-- with DNA boost --")
-        print(_format_logs(logs_with_dna))
-    no_dna_retained = bool((keep_no_dna == sentinel_idx).any())
-    dna_retained = bool((keep_with_dna == sentinel_idx).any())
+        print("-- without Proto boost --")
+        print(_format_logs(logs_no_proto))
+        print("-- with Proto boost --")
+        print(_format_logs(logs_with_proto))
+    no_proto_retained = bool((keep_no_proto == sentinel_idx).any())
+    proto_retained = bool((keep_with_proto == sentinel_idx).any())
     print(
-        f"without DNA retained? {no_dna_retained} | with DNA retained? {dna_retained}"
+        f"without Proto retained? {no_proto_retained} | with Proto retained? {proto_retained}"
     )
 
     print("\n=== Ordering sanity (RoPE alignment) ===")
@@ -492,7 +492,7 @@ def run_checks(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Synthetic validation checks for the chunked Flux demo."
+        description="Synthetic validation checks for the chunked Shortlist demo."
     )
     parser.add_argument("--seq-len", type=int, default=8192)
     parser.add_argument("--chunk-len", type=int, default=1024)

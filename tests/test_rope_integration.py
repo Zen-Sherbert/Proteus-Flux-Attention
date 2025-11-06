@@ -1,6 +1,6 @@
 import torch
 
-from proteus_attention.models.dmoah import CausalDynamicAttention, ModelConfig
+from proteus_attention.models.dmoah import AdaptiveSparseAttention, ModelConfig
 
 
 def test_rope_checkpoint_roundtrip(tmp_path):
@@ -13,7 +13,7 @@ def test_rope_checkpoint_roundtrip(tmp_path):
         attn_variant="dmoah",
         attn_use_rope=True,
     )
-    model = CausalDynamicAttention(config)
+    model = AdaptiveSparseAttention(config)
     payload = {
         "config": config.to_dict(),
         "state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
@@ -22,7 +22,7 @@ def test_rope_checkpoint_roundtrip(tmp_path):
     torch.save(payload, ckpt_path)
 
     loaded = torch.load(ckpt_path, map_location="cpu")
-    restored = CausalDynamicAttention(ModelConfig(**loaded["config"]))
+    restored = AdaptiveSparseAttention(ModelConfig(**loaded["config"]))
     restored.load_state_dict(loaded["state_dict"])
 
     assert restored.use_rope

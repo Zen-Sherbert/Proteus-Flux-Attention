@@ -9,10 +9,11 @@ description = "Genetic Attention modules powered by the Dynamic Mixture-of-Atten
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Scott Dietz" }]
-keywords = ["attention", "sparse-attention", "proteus", "flux", "triton", "deep-learning"]
+keywords = ["attention", "sparse-attention", "proteus", "shortlist", "triton", "deep-learning"]
 license = "Apache-2.0"
 dependencies = [
     "torch>=2.1",
+    "transformers>=4.37",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

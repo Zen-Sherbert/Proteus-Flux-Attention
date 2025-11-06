@@ -3,8 +3,8 @@
 Quick sanity check for Proteus Attention installations.
 
 The script validates that PyTorch and Triton (when available) can import the
-Proteus Flux-enabled attention modules, then runs a tiny forward pass on CPU and, if a
-GPU/ROCm device is visible, repeats the exercise with the Proteus Flux slider forced to
+Proteus Shortlist-enabled attention modules, then runs a tiny forward pass on CPU and, if a
+GPU/ROCm device is visible, repeats the exercise with the Proteus Shortlist slider forced to
 its linear regime.
 """
 
@@ -23,7 +23,7 @@ if SRC_ROOT.exists():
 
 import torch
 
-from proteus_attention.models.dmoah import CausalDynamicAttention, ModelConfig
+from proteus_attention.models.dmoah import AdaptiveSparseAttention, ModelConfig
 
 
 @dataclass
@@ -34,7 +34,7 @@ class CheckResult:
     message: str
 
 
-def _run_smoke(device: torch.device, *, flux_alpha: float) -> CheckResult:
+def _run_smoke(device: torch.device, *, shortlist_alpha: float) -> CheckResult:
     torch.manual_seed(0)
     batch, seq_len, d_model, heads = 2, 128, 64, 4
     cfg = ModelConfig(
@@ -47,22 +47,22 @@ def _run_smoke(device: torch.device, *, flux_alpha: float) -> CheckResult:
         attn_linear_L_min=16,
         attn_linear_L_max=32,
     )
-    model = CausalDynamicAttention(cfg).to(device=device)
-    if hasattr(model, "set_flux_alpha"):
-        model.set_flux_alpha(flux_alpha)
+    model = AdaptiveSparseAttention(cfg).to(device=device)
+    if hasattr(model, "set_shortlist_alpha"):
+        model.set_shortlist_alpha(shortlist_alpha)
     x = torch.randn(batch, seq_len, d_model, device=device, dtype=torch.get_default_dtype())
     try:
         with torch.inference_mode():
             y = model(x)
     except Exception as exc:  # noqa: BLE001
         return CheckResult(
-            label=f"Proteus Flux smoke (alpha={flux_alpha})",
+            label=f"Proteus Shortlist smoke (alpha={shortlist_alpha})",
             device=device,
             success=False,
             message=f"{type(exc).__name__}: {exc}",
         )
     return CheckResult(
-        label=f"Proteus Flux smoke (alpha={flux_alpha})",
+        label=f"Proteus Shortlist smoke (alpha={shortlist_alpha})",
         device=device,
         success=True,
         message=f"output={tuple(y.shape)}",
@@ -79,13 +79,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     results: list[CheckResult] = []
-    # CPU baseline (no flux override so the module auto-selects dense/subquad paths)
-    results.append(_run_smoke(torch.device("cpu"), flux_alpha=0.0))
+    # CPU baseline (no shortlist override so the module auto-selects dense/subquad paths)
+    results.append(_run_smoke(torch.device("cpu"), shortlist_alpha=0.0))
 
     if not args.no_gpu and torch.cuda.is_available():
-        results.append(_run_smoke(torch.device("cuda"), flux_alpha=1.0))
+        results.append(_run_smoke(torch.device("cuda"), shortlist_alpha=1.0))
     elif not args.no_gpu and torch.backends.mps.is_available():  # pragma: no cover - macOS convenience
-        results.append(_run_smoke(torch.device("mps"), flux_alpha=1.0))
+        results.append(_run_smoke(torch.device("mps"), shortlist_alpha=1.0))
 
     failed = [result for result in results if not result.success]
     for result in results:

@@ -114,7 +114,7 @@ else:
         _CACHE_DIR = Path.home() / ".cache" / "proteus_attention"
     except Exception:
         _CACHE_DIR = Path.cwd() / ".proteus_attention_cache"
-_CACHE_FILE = _CACHE_DIR / "flux_block_config.json"
+_CACHE_FILE = _CACHE_DIR / "shortlist_block_config.json"
 _BLOCK_CONFIG_CACHE: Dict[str, Tuple[int, int, int]] = {}
 
 
@@ -229,93 +229,93 @@ def get_block_config_cache() -> Dict[str, Tuple[int, int, int]]:
     return dict(_BLOCK_CONFIG_CACHE)
 
 
-def _flux_prepare_dna_candidates(
+def _shortlist_prepare_proto_candidates(
     rows: torch.Tensor,
     seq_len: int,
     max_candidates: int,
-    dna_scores: Optional[torch.Tensor],
-    dna_cap: int,
+    proto_scores: Optional[torch.Tensor],
+    proto_cap: int,
 ) -> Optional[torch.Tensor]:
-    if dna_scores is None:
+    if proto_scores is None:
         return None
-    if dna_scores.numel() == 0:
+    if proto_scores.numel() == 0:
         return None
-    if dna_cap <= 0 or max_candidates <= 0:
+    if proto_cap <= 0 or max_candidates <= 0:
         return None
     device = rows.device
-    dna = dna_scores.detach().to(device=device, dtype=torch.float32)
-    dna = dna[:seq_len]
-    if dna.dim() == 0:
-        dna = dna.unsqueeze(0)
-    if dna.dim() > 1:
-        dna = dna.view(-1)
-    if dna.numel() == 0:
+    proto = proto_scores.detach().to(device=device, dtype=torch.float32)
+    proto = proto[:seq_len]
+    if proto.dim() == 0:
+        proto = proto.unsqueeze(0)
+    if proto.dim() > 1:
+        proto = proto.view(-1)
+    if proto.numel() == 0:
         return None
 
-    max_index = dna.size(0)
-    cap = min(max_candidates, dna_cap, max_index)
+    max_index = proto.size(0)
+    cap = min(max_candidates, proto_cap, max_index)
     if cap <= 0:
         return None
 
     counts = torch.clamp(rows + 1, max=cap)
     indices = torch.arange(max_index, device=device)
     mask = indices.unsqueeze(0) <= rows.unsqueeze(1)
-    scores = dna.unsqueeze(0).expand(rows.size(0), -1)
+    scores = proto.unsqueeze(0).expand(rows.size(0), -1)
     scores = scores.masked_fill(~mask, float('-inf'))
     top_idx = torch.topk(scores, k=cap, dim=1).indices.to(rows.dtype)
 
     base = rows.unsqueeze(1).expand(-1, cap).to(rows.dtype)
-    dna_candidates = base.clone()
+    proto_candidates = base.clone()
     valid = torch.arange(cap, device=device).unsqueeze(0) < counts.unsqueeze(1)
-    dna_candidates = torch.where(valid, top_idx.to(rows.dtype), dna_candidates)
-    return dna_candidates
+    proto_candidates = torch.where(valid, top_idx.to(rows.dtype), proto_candidates)
+    return proto_candidates
 
 
-def _flux_prepare_dna_candidates_grouped(
+def _shortlist_prepare_proto_candidates_grouped(
     rows: torch.Tensor,
     row_batch_ids: Optional[torch.Tensor],
     seq_len: int,
     max_candidates: int,
-    dna_scores: Optional[torch.Tensor],
-    dna_cap: int,
+    proto_scores: Optional[torch.Tensor],
+    proto_cap: int,
 ) -> Optional[torch.Tensor]:
     """
-    Vectorised helper that assembles DNA shortlist candidates for multiple batches at once.
+    Vectorised helper that assembles prototype shortlist candidates for multiple batches at once.
 
     Parameters
     ----------
     rows:
         Tensor of active token indices with shape ``(N,)``.
     row_batch_ids:
-        Tensor of shape ``(N,)`` mapping each row to the batch index whose DNA scores should be used.
-    dna_scores:
-        Optional tensor containing DNA similarity values. Expected shape ``(B, seq_len)`` or
+        Tensor of shape ``(N,)`` mapping each row to the batch index whose prototype scores should be used.
+    proto_scores:
+        Optional tensor containing prototype similarity values. Expected shape ``(B, seq_len)`` or
         ``(seq_len,)`` when only a single batch is present.
     """
 
     if (
-        dna_scores is None
-        or dna_scores.numel() == 0
-        or dna_cap <= 0
+        proto_scores is None
+        or proto_scores.numel() == 0
+        or proto_cap <= 0
         or max_candidates <= 0
         or rows.numel() == 0
     ):
         return None
 
-    if dna_scores.dim() == 1:
-        dna_scores = dna_scores.unsqueeze(0)
+    if proto_scores.dim() == 1:
+        proto_scores = proto_scores.unsqueeze(0)
 
     if row_batch_ids is None:
-        if dna_scores.size(0) != 1:
+        if proto_scores.size(0) != 1:
             warnings.warn(
-                "row_batch_ids not provided for grouped DNA candidates; using first DNA vector for all rows.",
+                "row_batch_ids not provided for grouped prototype candidates; using first prototype vector for all rows.",
                 RuntimeWarning,
             )
         row_batch_ids = torch.zeros_like(rows, dtype=torch.long)
     else:
         row_batch_ids = row_batch_ids.to(device=rows.device).to(torch.long)
 
-    cap = min(max_candidates, dna_cap, seq_len)
+    cap = min(max_candidates, proto_cap, seq_len)
     if cap <= 0:
         return None
 
@@ -329,13 +329,13 @@ def _flux_prepare_dna_candidates_grouped(
         if torch.count_nonzero(mask) == 0:
             continue
         subset_rows = rows[mask]
-        dna_vec = dna_scores[batch_id]
-        candidates = _flux_prepare_dna_candidates(
+        proto_vec = proto_scores[batch_id]
+        candidates = _shortlist_prepare_proto_candidates(
             subset_rows,
             seq_len,
             max_candidates=max_candidates,
-            dna_scores=dna_vec,
-            dna_cap=dna_cap,
+            proto_scores=proto_vec,
+            proto_cap=proto_cap,
         )
         if candidates is None or candidates.numel() == 0:
             continue
@@ -345,7 +345,7 @@ def _flux_prepare_dna_candidates_grouped(
     return result
 
 
-def build_flux_candidates(
+def build_shortlist_candidates(
     rows: torch.Tensor,
     seq_len: int,
     *,
@@ -354,10 +354,10 @@ def build_flux_candidates(
     anchor_stride: int,
     use_local: bool,
     use_anchors: bool,
-    dna_scores: Optional[torch.Tensor] = None,
+    proto_scores: Optional[torch.Tensor] = None,
     local_cap: Optional[int] = None,
     anchor_cap: Optional[int] = None,
-    dna_cap: Optional[int] = None,
+    proto_cap: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if rows.numel() == 0 or max_candidates <= 0:
         empty = rows.new_empty(rows.shape + (0,))
@@ -369,7 +369,7 @@ def build_flux_candidates(
 
     local_cap_val = max(0, int(local_cap)) if local_cap is not None else (max_candidates if use_local else 0)
     anchor_cap_val = max(0, int(anchor_cap)) if anchor_cap is not None else (max_candidates if use_anchors else 0)
-    dna_cap_val = max(0, int(dna_cap)) if dna_cap is not None else (max_candidates if dna_scores is not None else 0)
+    proto_cap_val = max(0, int(proto_cap)) if proto_cap is not None else (max_candidates if proto_scores is not None else 0)
 
     if use_local and local_cap_val > 0:
         window = min(linear_window, max_candidates, local_cap_val)
@@ -391,9 +391,9 @@ def build_flux_candidates(
             anchors = torch.clamp(anchors, min=0)
             pieces.append(anchors)
 
-    dna_candidates = _flux_prepare_dna_candidates(rows, seq_len, max_candidates, dna_scores, dna_cap_val)
-    if dna_candidates is not None and dna_candidates.numel() > 0:
-        pieces.append(dna_candidates.to(dtype))
+    proto_candidates = _shortlist_prepare_proto_candidates(rows, seq_len, max_candidates, proto_scores, proto_cap_val)
+    if proto_candidates is not None and proto_candidates.numel() > 0:
+        pieces.append(proto_candidates.to(dtype))
 
     if pieces:
         candidates = torch.cat(pieces, dim=1)
@@ -414,8 +414,8 @@ def build_flux_candidates(
     valid_keep = keep_mask & (unique_indices >= 0)
     valid_keep = valid_keep & (unique_indices < max_candidates)
 
-    flux_lengths = valid_keep.sum(dim=1, dtype=torch.long)
-    flux_lengths = torch.clamp(flux_lengths, min=1)
+    shortlist_lengths = valid_keep.sum(dim=1, dtype=torch.long)
+    shortlist_lengths = torch.clamp(shortlist_lengths, min=1)
 
     output = rows.unsqueeze(1).expand(-1, max_candidates).to(dtype).clone()
     if valid_keep.any():
@@ -423,10 +423,10 @@ def build_flux_candidates(
         dst_col = unique_indices[row_idx, src_col].to(torch.long)
         output[row_idx, dst_col] = candidates[row_idx, src_col]
 
-    return output.contiguous(), flux_lengths.contiguous()
+    return output.contiguous(), shortlist_lengths.contiguous()
 
 
-def build_packed_flux_candidates(
+def build_packed_shortlist_candidates(
     rows: torch.Tensor,
     row_batch_ids: Optional[torch.Tensor],
     seq_len: int,
@@ -436,18 +436,18 @@ def build_packed_flux_candidates(
     anchor_stride: int,
     use_local: bool,
     use_anchors: bool,
-    dna_scores: Optional[torch.Tensor] = None,
+    proto_scores: Optional[torch.Tensor] = None,
     local_cap: Optional[int] = None,
     anchor_cap: Optional[int] = None,
-    dna_cap: Optional[int] = None,
+    proto_cap: Optional[int] = None,
     chunk_size: int = 4096,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Assemble Flux shortlist candidates for a packed set of rows spanning multiple heads/batches.
+    Assemble Shortlist shortlist candidates for a packed set of rows spanning multiple heads/batches.
 
-    Parameters mirror :func:`build_flux_candidates`, but ``rows`` contains every active row in the
-    packed structure and ``row_batch_ids`` provides a lookup into ``dna_scores`` so we can generate
-    DNA teleportation slots without looping head-by-head in Python.
+    Parameters mirror :func:`build_shortlist_candidates`, but ``rows`` contains every active row in the
+    packed structure and ``row_batch_ids`` provides a lookup into ``proto_scores`` so we can generate
+    Prototype shortlist slots without looping head-by-head in Python.
     """
 
     if rows.numel() == 0 or max_candidates <= 0:
@@ -467,16 +467,16 @@ def build_packed_flux_candidates(
         if anchor_cap is not None
         else (max_candidates if use_anchors else 0)
     )
-    dna_cap_val = (
-        max(0, int(dna_cap))
-        if dna_cap is not None
-        else (max_candidates if dna_scores is not None else 0)
+    proto_cap_val = (
+        max(0, int(proto_cap))
+        if proto_cap is not None
+        else (max_candidates if proto_scores is not None else 0)
     )
 
     chunk_size = max(1, int(chunk_size))
     total_rows = rows.size(0)
     output = rows.unsqueeze(1).expand(-1, max_candidates).to(dtype).clone()
-    flux_lengths = torch.ones(total_rows, device=device, dtype=torch.long)
+    shortlist_lengths = torch.ones(total_rows, device=device, dtype=torch.long)
 
     for start in range(0, total_rows, chunk_size):
         end = min(start + chunk_size, total_rows)
@@ -504,20 +504,20 @@ def build_packed_flux_candidates(
                 anchors = torch.clamp(anchors, min=0)
                 chunk_pieces.append(anchors)
 
-        if dna_scores is not None and dna_cap_val > 0:
+        if proto_scores is not None and proto_cap_val > 0:
             chunk_batch_ids = None
             if row_batch_ids is not None:
                 chunk_batch_ids = row_batch_ids[start:end]
-            dna_chunk = _flux_prepare_dna_candidates_grouped(
+            proto_chunk = _shortlist_prepare_proto_candidates_grouped(
                 chunk_rows,
                 chunk_batch_ids,
                 seq_len,
                 max_candidates=max_candidates,
-                dna_scores=dna_scores,
-                dna_cap=dna_cap_val,
+                proto_scores=proto_scores,
+                proto_cap=proto_cap_val,
             )
-            if dna_chunk is not None and dna_chunk.numel() > 0:
-                chunk_pieces.append(dna_chunk.to(dtype))
+            if proto_chunk is not None and proto_chunk.numel() > 0:
+                chunk_pieces.append(proto_chunk.to(dtype))
 
         if chunk_pieces:
             candidates = torch.cat(chunk_pieces, dim=1)
@@ -548,12 +548,12 @@ def build_packed_flux_candidates(
             chunk_output[row_idx, dst_col] = candidates[row_idx, src_col]
 
         output[start:end] = chunk_output
-        flux_lengths[start:end] = chunk_lengths
+        shortlist_lengths[start:end] = chunk_lengths
 
-    return output.contiguous(), flux_lengths.contiguous()
+    return output.contiguous(), shortlist_lengths.contiguous()
 if TRITON_AVAILABLE:
     @triton.jit  # pragma: no cover - executed on device
-    def _flux_attention_kernel(
+    def _shortlist_attention_kernel(
         Q_ACTIVE_PTR,
         K_PTR,
         V_PTR,
@@ -599,7 +599,7 @@ if TRITON_AVAILABLE:
         HAS_KSCALE: tl.constexpr,  # type: ignore[assignment]
         HAS_VSCALE: tl.constexpr,  # type: ignore[assignment]
     ):
-        # One Kernel to Rule them All — the Flux kernel adapts on the fly.
+        # One Kernel to Rule them All — the Shortlist kernel adapts on the fly.
         NEG_INF = float('-inf')
         pid_block = tl.program_id(0)
         pid_head = tl.program_id(1)
@@ -875,7 +875,7 @@ if TRITON_AVAILABLE:
                 mask=row_mask[:, None] & d_mask[None, :],
             )
 else:
-    _flux_attention_kernel = None  # type: ignore[assignment]
+    _shortlist_attention_kernel = None  # type: ignore[assignment]
 
 
 def _pack_active_rows(
@@ -916,16 +916,16 @@ def _fallback_sparse_attention(
     scale: float,
     dropout_real: float,
     training: bool,
-    flux_candidates: Optional[torch.Tensor],
-    flux_lengths: Optional[torch.Tensor],
+    shortlist_candidates: Optional[torch.Tensor],
+    shortlist_lengths: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """Reference Flux attention using PyTorch ops per head (fallback path)."""
+    """Reference Shortlist attention using PyTorch ops per head (fallback path)."""
 
     batch_heads, tokens, head_dim = q.shape
 
     result = torch.zeros_like(q)
     row_offsets_cpu = row_offsets.cpu()
-    use_flux = flux_candidates is not None and flux_lengths is not None and flux_candidates.numel() > 0
+    use_shortlist = shortlist_candidates is not None and shortlist_lengths is not None and shortlist_candidates.numel() > 0
 
     for head in range(batch_heads):
         start = int(row_offsets_cpu[head].item())
@@ -936,9 +936,9 @@ def _fallback_sparse_attention(
         rows_tokens = token_idx[start:end]
         q_sel = q_active[start:end]
 
-        if use_flux:
-            cand_rows = flux_candidates[start:end].to(device=q.device, dtype=torch.long)
-            len_rows = flux_lengths[start:end].to(device=q.device, dtype=torch.long)
+        if use_shortlist:
+            cand_rows = shortlist_candidates[start:end].to(device=q.device, dtype=torch.long)
+            len_rows = shortlist_lengths[start:end].to(device=q.device, dtype=torch.long)
             max_len = cand_rows.size(1)
 
             k_head = k[head]
@@ -1012,10 +1012,10 @@ def _should_try_triton(
     dropout_p: float,
     training: bool,
     causal_mask: Optional[torch.Tensor],
-    flux_candidates: Optional[torch.Tensor],
-    flux_lengths: Optional[torch.Tensor],
+    shortlist_candidates: Optional[torch.Tensor],
+    shortlist_lengths: Optional[torch.Tensor],
 ) -> bool:
-    """Return ``True`` when the Flux Triton path can be attempted."""
+    """Return ``True`` when the Shortlist Triton path can be attempted."""
 
     if not TRITON_AVAILABLE:
         return False
@@ -1028,12 +1028,12 @@ def _should_try_triton(
     limit = TRITON_SEQ_LEN_LIMIT
     if limit and limit > 0 and q.size(1) > limit:
         return False
-    if flux_candidates is not None and flux_lengths is None:
+    if shortlist_candidates is not None and shortlist_lengths is None:
         return False
     return True
 
 
-def _run_flux_attention_kernel(
+def _run_shortlist_attention_kernel(
     block_cfg: Tuple[int, int, int],
     *,
     q_active: torch.Tensor,
@@ -1086,7 +1086,7 @@ def _run_flux_attention_kernel(
         triton.cdiv(max_rows, block_m),
         heads,
     )
-    _flux_attention_kernel[grid](
+    _shortlist_attention_kernel[grid](
         q_active,
         k,
         v,
@@ -1198,10 +1198,10 @@ def _launch_triton_sparse_attention(
     q_scale: Optional[torch.Tensor],
     k_scale: Optional[torch.Tensor],
     v_scale: Optional[torch.Tensor],
-    flux_candidates: Optional[torch.Tensor],
-    flux_lengths: Optional[torch.Tensor],
+    shortlist_candidates: Optional[torch.Tensor],
+    shortlist_lengths: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """Launch the Triton Flux kernel for the DMoAH sparse attention forward pass."""
+    """Launch the Triton Shortlist kernel for the DMoAH sparse attention forward pass."""
 
     if not TRITON_AVAILABLE:
         raise RuntimeError("Triton runtime is not available")
@@ -1254,13 +1254,13 @@ def _launch_triton_sparse_attention(
     dropout_p = float(dropout_p)
     dropout_scale = float(dropout_scale)
 
-    if flux_candidates is not None and flux_lengths is not None and flux_candidates.numel() > 0:
-        cand_contig = flux_candidates.to(device=q.device, dtype=torch.int32).contiguous()
-        len_contig = flux_lengths.to(device=q.device, dtype=torch.int32).contiguous()
+    if shortlist_candidates is not None and shortlist_lengths is not None and shortlist_candidates.numel() > 0:
+        cand_contig = shortlist_candidates.to(device=q.device, dtype=torch.int32).contiguous()
+        len_contig = shortlist_lengths.to(device=q.device, dtype=torch.int32).contiguous()
         if cand_contig.size(0) != token_contig.size(0):
-            raise ValueError("Flux candidate rows must match the number of active tokens.")
+            raise ValueError("Shortlist candidate rows must match the number of active tokens.")
         if len_contig.size(0) != token_contig.size(0):
-            raise ValueError("Flux candidate lengths must match the number of active tokens.")
+            raise ValueError("Shortlist candidate lengths must match the number of active tokens.")
         max_cand = int(cand_contig.size(1))
         use_candidates = max_cand > 0
     else:
@@ -1306,10 +1306,10 @@ def _launch_triton_sparse_attention(
         def _benchmark(block_cfg: Tuple[int, int, int]) -> Optional[float]:
             tmp_out = torch.empty_like(out)
             torch.cuda.synchronize(device)
-            _run_flux_attention_kernel(block_cfg, out=tmp_out, **kernel_args)
+            _run_shortlist_attention_kernel(block_cfg, out=tmp_out, **kernel_args)
             torch.cuda.synchronize(device)
             start = time.perf_counter()
-            _run_flux_attention_kernel(block_cfg, out=tmp_out, **kernel_args)
+            _run_shortlist_attention_kernel(block_cfg, out=tmp_out, **kernel_args)
             torch.cuda.synchronize(device)
             return time.perf_counter() - start
 
@@ -1320,7 +1320,7 @@ def _launch_triton_sparse_attention(
 
     block_cfg = _select_block_config(device, head_dim, _benchmark)
 
-    _run_flux_attention_kernel(block_cfg, out=out, **kernel_args)
+    _run_shortlist_attention_kernel(block_cfg, out=out, **kernel_args)
 
     return out
 
@@ -1341,8 +1341,8 @@ def dmoah_sparse_attention(
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
-    flux_candidates: Optional[torch.Tensor] = None,
-    flux_lengths: Optional[torch.Tensor] = None,
+    shortlist_candidates: Optional[torch.Tensor] = None,
+    shortlist_lengths: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Reference fallback for the DMoAH sparse attention kernel.
@@ -1358,9 +1358,9 @@ def dmoah_sparse_attention(
     causal_mask:
         Optional additive mask with shape ``(T, T)`` (values should be 0 or
         ``-inf``).  When provided we expand it for SDPA.
-    flux_candidates / flux_lengths:
-        Optional per-row candidate lists for Flux mode. ``flux_candidates``
-        should have shape ``(N_active, L_max)`` and ``flux_lengths`` shape
+    shortlist_candidates / shortlist_lengths:
+        Optional per-row candidate lists for Shortlist mode. ``shortlist_candidates``
+        should have shape ``(N_active, L_max)`` and ``shortlist_lengths`` shape
         ``(N_active,)`` describing how many entries of each row are valid.
     dropout_p:
         Attention dropout probability.  Passed through to the dense routine.
@@ -1437,24 +1437,24 @@ def dmoah_sparse_attention(
 
     head_idx, token_idx, row_offsets, max_rows = packed
 
-    flux_runtime_candidates: Optional[torch.Tensor]
-    flux_runtime_lengths: Optional[torch.Tensor]
-    if flux_candidates is not None or flux_lengths is not None:
-        if flux_candidates is None or flux_lengths is None:
-            raise ValueError("flux_candidates and flux_lengths must be provided together.")
-        if flux_candidates.dim() != 2:
-            raise ValueError("flux_candidates must have shape (N_active, L_max)")
-        if flux_lengths.dim() != 1:
-            raise ValueError("flux_lengths must have shape (N_active,)")
-        if flux_candidates.size(0) != flux_lengths.size(0):
-            raise ValueError("flux_lengths must align with flux_candidate rows")
-        flux_runtime_candidates = flux_candidates.to(device=q.device, dtype=torch.long).contiguous()
-        flux_runtime_lengths = flux_lengths.to(device=q.device, dtype=torch.long).contiguous()
-        if flux_runtime_candidates.size(0) != token_idx.numel():
-            raise ValueError("Flux candidates must match the number of active rows")
+    shortlist_runtime_candidates: Optional[torch.Tensor]
+    shortlist_runtime_lengths: Optional[torch.Tensor]
+    if shortlist_candidates is not None or shortlist_lengths is not None:
+        if shortlist_candidates is None or shortlist_lengths is None:
+            raise ValueError("shortlist_candidates and shortlist_lengths must be provided together.")
+        if shortlist_candidates.dim() != 2:
+            raise ValueError("shortlist_candidates must have shape (N_active, L_max)")
+        if shortlist_lengths.dim() != 1:
+            raise ValueError("shortlist_lengths must have shape (N_active,)")
+        if shortlist_candidates.size(0) != shortlist_lengths.size(0):
+            raise ValueError("shortlist_lengths must align with shortlist_candidate rows")
+        shortlist_runtime_candidates = shortlist_candidates.to(device=q.device, dtype=torch.long).contiguous()
+        shortlist_runtime_lengths = shortlist_lengths.to(device=q.device, dtype=torch.long).contiguous()
+        if shortlist_runtime_candidates.size(0) != token_idx.numel():
+            raise ValueError("Shortlist candidates must match the number of active rows")
     else:
-        flux_runtime_candidates = None
-        flux_runtime_lengths = None
+        shortlist_runtime_candidates = None
+        shortlist_runtime_lengths = None
 
     if CUDA_BACKEND is not None and q.is_cuda and not is_quantized:
         try:  # pragma: no cover - optional path
@@ -1467,8 +1467,8 @@ def dmoah_sparse_attention(
                 dropout_p=dropout_real,
                 training=training,
                 prepacked=packed,
-                flux_candidates=flux_runtime_candidates,
-                flux_lengths=flux_runtime_lengths,
+                shortlist_candidates=shortlist_runtime_candidates,
+                shortlist_lengths=shortlist_runtime_lengths,
             )
         except Exception as exc:  # noqa: BLE001
             warnings.warn(f"Falling back from CUDA kernel: {exc}", RuntimeWarning)
@@ -1507,8 +1507,8 @@ def dmoah_sparse_attention(
         dropout_p=dropout_real,
         training=training,
         causal_mask=causal_mask,
-        flux_candidates=flux_runtime_candidates,
-        flux_lengths=flux_runtime_lengths,
+        shortlist_candidates=shortlist_runtime_candidates,
+        shortlist_lengths=shortlist_runtime_lengths,
     ):
         has_dropout = dropout_real > 0.0
         dropout_seed = 0
@@ -1552,8 +1552,8 @@ def dmoah_sparse_attention(
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
-                flux_candidates=flux_runtime_candidates,
-                flux_lengths=flux_runtime_lengths,
+                shortlist_candidates=shortlist_runtime_candidates,
+                shortlist_lengths=shortlist_runtime_lengths,
             )
         except (NotImplementedError, RuntimeError):
             triton_out = None
@@ -1579,8 +1579,8 @@ def dmoah_sparse_attention(
         scale=scale,
         dropout_real=dropout_real,
         training=training,
-        flux_candidates=flux_runtime_candidates,
-        flux_lengths=flux_runtime_lengths,
+        shortlist_candidates=shortlist_runtime_candidates,
+        shortlist_lengths=shortlist_runtime_lengths,
     )
 
     fallback = fallback.view(batch_heads, tokens, head_dim)
@@ -1599,6 +1599,6 @@ __all__ = [
     "dmoah_sparse_attention",
     "get_last_backend",
     "get_last_backend_info",
-    "build_flux_candidates",
-    "build_packed_flux_candidates",
+    "build_shortlist_candidates",
+    "build_packed_shortlist_candidates",
 ]

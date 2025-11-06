@@ -22,7 +22,7 @@ class SparseCtlSnapshot:
 
 class SparseHeadController:
     """
-    Lightweight controller that nudges ``CausalGeneticAttention`` head budgets toward
+    Lightweight controller that nudges ``AdaptiveSparseProtoAttention`` head budgets toward
     a desired active density.  The implementation mirrors the example training loop
     (`examples/dmoah_train.py`) but keeps the API minimal so modules can use it directly.
 
@@ -73,7 +73,7 @@ class SparseHeadController:
 
     def observe(self, head_stats: Optional[Dict[str, Any]]) -> Optional[SparseCtlSnapshot]:
         """
-        Consume the ``last_head_stats`` dictionary emitted by ``CausalGeneticAttention``.
+        Consume the ``last_head_stats`` dictionary emitted by ``AdaptiveSparseProtoAttention``.
         Returns a snapshot when an adjustment occurs, otherwise ``None``.
         """
         self._step += 1

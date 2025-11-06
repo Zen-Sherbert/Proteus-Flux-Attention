@@ -1,5 +1,5 @@
 """
-Reusable Chunked Flux pipeline utilities.
+Reusable Chunked Shortlist pipeline utilities.
 
 This module promotes the previous demo script to a production-oriented tool:
 
@@ -8,7 +8,7 @@ This module promotes the previous demo script to a production-oriented tool:
   addition to synthetic random tensors.
 * Provides structured metrics and chunk-level diagnostics for downstream use.
 * Handles both CUDA/ROCm and CPU execution paths gracefully.
-* Exposes a ``ChunkedFluxRunner`` class that callers can use directly or wrap in
+* Exposes a ``ChunkedShortlistRunner`` class that callers can use directly or wrap in
   their own automation.
 """
 from __future__ import annotations
@@ -27,7 +27,7 @@ import numpy as np
 import torch
 
 from proteus_attention.kernels.sparse_attn import get_last_backend_info
-from proteus_attention.models.dmoah import CausalDynamicAttention, ModelConfig
+from proteus_attention.models.dmoah import AdaptiveSparseAttention, ModelConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -41,16 +41,16 @@ try:  # pragma: no cover - optional dependency
 except Exception:  # pragma: no cover
     psutil = None  # type: ignore[attr-defined]
 
-# IMPORTANT: The sparse Triton backend autotunes the Flux kernel the first time
+# IMPORTANT: The sparse Triton backend autotunes the shortlist kernel the first time
 # it sees a new (chunk_len, head_dim, device) combination. For large chunks this
 # benchmark sweep can take minutes and looks like a hang. Setting
 # PROTEUS_TUNE_DISABLE=1 (or pre-populating the cache) skips autotune and makes
 # smoke tests responsive.
 
 
-# ROCm LLVM currently asserts when compiling Flux-style linear kernels above ~64K
+# ROCm LLVM currently asserts when compiling shortlist-style linear kernels above ~64K
 # tokens per chunk. Keep the hard limit conservative until upstream fixes land.
-MAX_FLUX_CHUNK_TOKENS = 65_536
+MAX_SHORTLIST_CHUNK_TOKENS = 65_536
 BYTES_PER_MB = 1024.0 * 1024.0
 
 
@@ -91,7 +91,7 @@ def _build_model_config(
     *,
     heads: int,
     sparse_ratio: float,
-    flux_alpha: float,
+    shortlist_alpha: float,
 ) -> ModelConfig:
     """Return a minimal ``ModelConfig`` tuned for chunked sparsity."""
 
@@ -122,21 +122,21 @@ def _build_model_config(
         attn_linear_L_max=256,
         attn_linear_switch_ctx=max(512, min(seq_len, 4096)),
         attn_linear_policy="local+anchors",
-        attn_dna_enable=True,
-        attn_dna_threshold=0.2,
-        attn_dna_blend=0.5,
-        attn_dna_temp=0.3,
+        attn_proto_enable=True,
+        attn_proto_threshold=0.2,
+        attn_proto_blend=0.5,
+        attn_proto_temp=0.3,
         attn_linear_token_keep_schedule="sqrt",
         attn_linear_token_keep_min_ratio=0.05,
         attn_track_latency=False,
         attn_small_seq_dense=0,
         use_sdpa=False,
-        attn_flux_alpha=flux_alpha,
+        attn_shortlist_alpha=shortlist_alpha,
     )
 
 
 def _select_top_tokens(
-    model: CausalDynamicAttention,
+    model: AdaptiveSparseAttention,
     global_offset: int,
     *,
     per_chunk_budget: int,
@@ -232,8 +232,8 @@ class ChunkSummary:
 
 
 @dataclass
-class ChunkedFluxMetrics:
-    """Aggregate metrics describing a Chunked Flux run."""
+class ChunkedShortlistMetrics:
+    """Aggregate metrics describing a Chunked Shortlist run."""
 
     original_tokens: int
     retained_tokens: int
@@ -256,13 +256,13 @@ class ChunkedFluxMetrics:
 
 
 @dataclass
-class ChunkedFluxResult:
-    """Structured output from :class:`ChunkedFluxRunner`."""
+class ChunkedShortlistResult:
+    """Structured output from :class:`ChunkedShortlistRunner`."""
 
     keep_indices: torch.Tensor
     keep_scores: torch.Tensor
     reduced_sequence: torch.Tensor
-    metrics: ChunkedFluxMetrics
+    metrics: ChunkedShortlistMetrics
     chunks: Sequence[ChunkSummary]
     final_output: Optional[torch.Tensor] = None
     final_stats: Optional[Dict[str, Any]] = None
@@ -270,8 +270,8 @@ class ChunkedFluxResult:
 
 
 @dataclass
-class ChunkedFluxConfig:
-    """Configuration for the Chunked Flux pipeline."""
+class ChunkedShortlistConfig:
+    """Configuration for the Chunked Shortlist pipeline."""
 
     seq_len: int
     d_model: int
@@ -286,7 +286,7 @@ class ChunkedFluxConfig:
     report_latency: bool = False
     progress: bool = False
     run_final_pass: bool = True
-    flux_alpha: float = 1.0
+    shortlist_alpha: float = 1.0
     storage: Literal["cpu", "disk", "auto"] = "auto"
     temp_dir: Optional[Path] = None
     ram_limit_bytes: Optional[int] = None
@@ -298,10 +298,10 @@ class ChunkedFluxConfig:
             raise ValueError("d_model must be positive.")
         if self.chunk_len <= 0:
             raise ValueError("chunk_len must be positive.")
-        if self.chunk_len > MAX_FLUX_CHUNK_TOKENS:
+        if self.chunk_len > MAX_SHORTLIST_CHUNK_TOKENS:
             raise ValueError(
                 f"chunk_len={self.chunk_len} exceeds the conservative "
-                f"MAX_FLUX_CHUNK_TOKENS={MAX_FLUX_CHUNK_TOKENS}. Larger values "
+                f"MAX_SHORTLIST_CHUNK_TOKENS={MAX_SHORTLIST_CHUNK_TOKENS}. Larger values "
                 "currently trigger ROCm/LLVM register allocation asserts; do "
                 "not increase this cap until upstream fixes land."
             )
@@ -313,20 +313,20 @@ class ChunkedFluxConfig:
             raise ValueError("chunk_sparse_ratio must be positive.")
         if self.final_sparse_ratio <= 0.0:
             raise ValueError("final_sparse_ratio must be positive.")
-        if not (0.0 <= self.flux_alpha <= 1.0):
-            raise ValueError("flux_alpha must be within [0, 1].")
+        if not (0.0 <= self.shortlist_alpha <= 1.0):
+            raise ValueError("shortlist_alpha must be within [0, 1].")
         if self.storage not in {"cpu", "disk", "auto"}:
             raise ValueError("storage must be 'cpu', 'disk', or 'auto'.")
         if self.ram_limit_bytes is not None and self.ram_limit_bytes <= 0:
             raise ValueError("ram_limit_bytes must be positive when provided.")
 
 
-class ChunkedFluxRunner:
-    """Execute the Chunked Flux pipeline with structured diagnostics."""
+class ChunkedShortlistRunner:
+    """Execute the Chunked Shortlist pipeline with structured diagnostics."""
 
     def __init__(
         self,
-        config: ChunkedFluxConfig,
+        config: ChunkedShortlistConfig,
         *,
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -334,7 +334,7 @@ class ChunkedFluxRunner:
         self.config.validate()
         self.logger = logger or LOGGER
 
-    def run(self, sequence: Optional[torch.Tensor] = None) -> ChunkedFluxResult:
+    def run(self, sequence: Optional[torch.Tensor] = None) -> ChunkedShortlistResult:
         """
         Run the chunked pipeline.
 
@@ -362,7 +362,7 @@ class ChunkedFluxRunner:
                     f"sequence hidden size {sequence.size(2)} does not match d_model={cfg.d_model}"
                 )
             if sequence.size(0) != 1:
-                raise ValueError("Chunked Flux runner currently expects batch size of 1.")
+                raise ValueError("Chunked Shortlist runner currently expects batch size of 1.")
             source_sequence = sequence[:, : cfg.seq_len].detach()
             base_dtype = source_sequence.dtype
         else:
@@ -454,7 +454,7 @@ class ChunkedFluxRunner:
             tmp_dir = Path(tmp_dir)
             tmp_dir.mkdir(parents=True, exist_ok=True)
             handle = tempfile.NamedTemporaryFile(
-                dir=tmp_dir, prefix="fluxchunk_", suffix=".mmap", delete=False
+                dir=tmp_dir, prefix="chunked_shortlist_", suffix=".mmap", delete=False
             )
             handle.close()
             memmap_path = Path(handle.name)
@@ -519,15 +519,15 @@ class ChunkedFluxRunner:
             cfg.d_model,
             heads=cfg.heads,
             sparse_ratio=cfg.chunk_sparse_ratio,
-            flux_alpha=cfg.flux_alpha,
+            shortlist_alpha=cfg.shortlist_alpha,
         )
-        chunk_model = CausalDynamicAttention(chunk_cfg).to(
+        chunk_model = AdaptiveSparseAttention(chunk_cfg).to(
             device=device, dtype=base_dtype
         ).eval()
         if hasattr(chunk_model, "use_sdpa"):
             chunk_model.use_sdpa = False
-        if hasattr(chunk_model, "set_flux_alpha"):
-            chunk_model.set_flux_alpha(float(cfg.flux_alpha))
+        if hasattr(chunk_model, "set_shortlist_alpha"):
+            chunk_model.set_shortlist_alpha(float(cfg.shortlist_alpha))
 
         chunk_tensor = torch.empty(
             batch, cfg.chunk_len, cfg.d_model, device=device, dtype=base_dtype
@@ -561,7 +561,7 @@ class ChunkedFluxRunner:
                 tqdm(
                     _chunk_iter(cfg.seq_len, cfg.chunk_len),
                     total=total_chunks,
-                    desc="Chunked Flux",
+                    desc="Chunked Shortlist",
                     unit="chunk",
                 )
             )
@@ -663,15 +663,15 @@ class ChunkedFluxRunner:
                     cfg.d_model,
                     heads=cfg.heads,
                     sparse_ratio=cfg.final_sparse_ratio,
-                    flux_alpha=cfg.flux_alpha,
+                    shortlist_alpha=cfg.shortlist_alpha,
                 )
-                final_model = CausalDynamicAttention(final_cfg).to(
+                final_model = AdaptiveSparseAttention(final_cfg).to(
                     device=device, dtype=base_dtype
                 ).eval()
                 if hasattr(final_model, "use_sdpa"):
                     final_model.use_sdpa = False
-                if hasattr(final_model, "set_flux_alpha"):
-                    final_model.set_flux_alpha(float(cfg.flux_alpha))
+                if hasattr(final_model, "set_shortlist_alpha"):
+                    final_model.set_shortlist_alpha(float(cfg.shortlist_alpha))
                 if device.type == "cuda":
                     torch.cuda.reset_peak_memory_stats(device)
                     final_start_event = final_end_event = None
@@ -719,7 +719,7 @@ class ChunkedFluxRunner:
             if total_time > 0:
                 total_tokens_per_s = float(cfg.seq_len / total_time)
 
-            metrics = ChunkedFluxMetrics(
+            metrics = ChunkedShortlistMetrics(
                 original_tokens=cfg.seq_len,
                 retained_tokens=int(keep_indices.numel()),
                 retention_ratio=float(keep_indices.numel() / max(cfg.seq_len, 1)),
@@ -745,7 +745,7 @@ class ChunkedFluxRunner:
             )
 
             self.logger.info(
-                "Chunked Flux retained %s/%s tokens (%.3f) across %s chunks",
+                "Chunked Shortlist retained %s/%s tokens (%.3f) across %s chunks",
                 metrics.retained_tokens,
                 metrics.original_tokens,
                 metrics.retention_ratio,
@@ -756,7 +756,7 @@ class ChunkedFluxRunner:
                     "Router importance unavailable; used norm-based fallback scoring."
                 )
 
-            result = ChunkedFluxResult(
+            result = ChunkedShortlistResult(
                 keep_indices=keep_indices,
                 keep_scores=keep_scores,
                 reduced_sequence=reduced_sequence,
@@ -776,10 +776,10 @@ class ChunkedFluxRunner:
 
 
 __all__ = [
-    "ChunkedFluxConfig",
-    "ChunkedFluxMetrics",
-    "ChunkedFluxResult",
-    "ChunkedFluxRunner",
+    "ChunkedShortlistConfig",
+    "ChunkedShortlistMetrics",
+    "ChunkedShortlistResult",
+    "ChunkedShortlistRunner",
     "ChunkSummary",
-    "MAX_FLUX_CHUNK_TOKENS",
+    "MAX_SHORTLIST_CHUNK_TOKENS",
 ]

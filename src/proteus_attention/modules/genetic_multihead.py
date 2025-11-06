@@ -8,13 +8,13 @@ import torch
 import torch.nn as nn
 
 from ..kernels.sparse_attn import get_last_backend_info
-from ..models.dmoah import CausalGeneticAttention, ModelConfig
+from ..models.dmoah import AdaptiveSparseProtoAttention, ModelConfig
 from .sparse_ctl import SparseHeadController, SparseCtlSnapshot
 
 
 class CausalGeneticMultiheadAttention(nn.Module):
     """
-    Thin adapter that exposes Genetic Attention via :class:`CausalGeneticAttention`
+    Thin adapter that exposes Genetic Attention via :class:`AdaptiveSparseProtoAttention`
     using the familiar ``nn.MultiheadAttention`` API (restricted to causal
     self-attention for now).
     """
@@ -56,7 +56,7 @@ class CausalGeneticMultiheadAttention(nn.Module):
             "bias": bool(bias),
             "attn_variant": "dmoah",
             "attn_mode": config_overrides.pop("attn_mode", "auto"),
-            "attn_dna_enable": bool(config_overrides.pop("attn_dna_enable", True)),
+            "attn_proto_enable": bool(config_overrides.pop("attn_proto_enable", True)),
             "n_ctx": int(max_seq_len or config_overrides.pop("n_ctx", 0)),
             "attn_linear_L": config_overrides.pop("attn_linear_L", 512),
             "attn_linear_window": config_overrides.pop("attn_linear_window", 512),
@@ -72,7 +72,7 @@ class CausalGeneticMultiheadAttention(nn.Module):
         cfg.update(config_overrides)
 
         config = ModelConfig(**cfg)
-        self.attention = CausalGeneticAttention(config)
+        self.attention = AdaptiveSparseProtoAttention(config)
         self.fallback_attention = nn.MultiheadAttention(
             embed_dim=self.embed_dim,
             num_heads=self.num_heads,

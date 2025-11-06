@@ -8,13 +8,13 @@ import torch.nn.functional as F
 
 import proteus_attention.kernels.sparse_attn as sparse_attn
 from proteus_attention.kernels.sparse_attn import (
-    build_flux_candidates,
-    build_packed_flux_candidates,
+    build_shortlist_candidates,
+    build_packed_shortlist_candidates,
     dmoah_sparse_attention,
 )
 from proteus_attention.models.dmoah import (
-    AttentionBlock,
-    CausalDynamicAttention,
+    AdaptiveSparseAttentionBlock,
+    AdaptiveSparseAttention,
     ModelConfig,
     MLP,
     _build_norm,
@@ -36,7 +36,7 @@ def _reference_shortlist(
     anchor_stride: int,
     use_local: bool,
     use_anchors: bool,
-    dna_scores: torch.Tensor | None,
+    proto_scores: torch.Tensor | None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if rows.numel() == 0:
         empty = rows.new_empty(rows.shape + (0,))
@@ -66,21 +66,21 @@ def _reference_shortlist(
     else:
         candidates = rows.unsqueeze(1)
 
-    if dna_scores is not None and dna_scores.numel() > 0:
-        sims = dna_scores.to(device=device)
-        dna = torch.empty(rows.size(0), linear_L, device=device, dtype=torch.long)
+    if proto_scores is not None and proto_scores.numel() > 0:
+        sims = proto_scores.to(device=device)
+        proto = torch.empty(rows.size(0), linear_L, device=device, dtype=torch.long)
         for i, row_val in enumerate(rows.tolist()):
             upto = int(row_val) + 1
             if upto <= 0:
-                dna[i].fill_(0)
+                proto[i].fill_(0)
                 continue
-            dna_k = min(linear_L, upto)
-            tmp = torch.topk(sims[:upto], k=dna_k).indices.to(device=device, dtype=torch.long)
+            proto_k = min(linear_L, upto)
+            tmp = torch.topk(sims[:upto], k=proto_k).indices.to(device=device, dtype=torch.long)
             if tmp.numel() < linear_L:
                 pad = rows.new_full((linear_L - tmp.numel(),), int(row_val))
                 tmp = torch.cat([pad, tmp], dim=0)
-            dna[i] = tmp[-linear_L:]
-        candidates = torch.cat([candidates, dna], dim=1)
+            proto[i] = tmp[-linear_L:]
+        candidates = torch.cat([candidates, proto], dim=1)
 
     candidates = torch.minimum(candidates, rows.unsqueeze(1))
     candidates = torch.clamp(candidates, min=0, max=seq_len - 1)
@@ -136,8 +136,8 @@ class StandardAttention(nn.Module):
         return self.dropout(self.proj(attn))
 
 
-class StandardAttentionBlock(nn.Module):
-    """Transformer block that mirrors AttentionBlock but with dense attention."""
+class StandardAdaptiveSparseAttentionBlock(nn.Module):
+    """Transformer block that mirrors AdaptiveSparseAttentionBlock but with dense attention."""
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
@@ -171,9 +171,9 @@ class GPT(nn.Module):
         blocks = []
         for _ in range(config.n_layer):
             if self.use_dmoah:
-                blocks.append(AttentionBlock(config))
+                blocks.append(AdaptiveSparseAttentionBlock(config))
             else:
-                blocks.append(StandardAttentionBlock(config))
+                blocks.append(StandardAdaptiveSparseAttentionBlock(config))
         self.blocks = nn.ModuleList(blocks)
         self.ln_f = nn.LayerNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
@@ -306,7 +306,7 @@ def test_dmoah_sparse_attention_quantized_int8_close_to_fp(percentile):
 
 
 @pytest.mark.parametrize(
-    ("use_local", "use_anchors", "use_dna"),
+    ("use_local", "use_anchors", "use_proto"),
     [
         (True, False, False),
         (True, True, False),
@@ -314,14 +314,14 @@ def test_dmoah_sparse_attention_quantized_int8_close_to_fp(percentile):
         (False, True, True),
     ],
 )
-def test_flux_candidates_match_reference_cpu(use_local, use_anchors, use_dna):
+def test_shortlist_candidates_match_reference_cpu(use_local, use_anchors, use_proto):
     torch.manual_seed(42)
     seq_len = 64
     rows = torch.randint(0, seq_len, (16,), dtype=torch.long)
     linear_L = 16
     linear_window = 12
     anchor_stride = 4
-    dna_scores = torch.rand(seq_len) if use_dna else None
+    proto_scores = torch.rand(seq_len) if use_proto else None
 
     expected_candidates, expected_lengths = _reference_shortlist(
         rows,
@@ -331,9 +331,9 @@ def test_flux_candidates_match_reference_cpu(use_local, use_anchors, use_dna):
         anchor_stride,
         use_local,
         use_anchors,
-        dna_scores,
+        proto_scores,
     )
-    flux_candidates, flux_lengths = build_flux_candidates(
+    shortlist_candidates, shortlist_lengths = build_shortlist_candidates(
         rows,
         seq_len,
         max_candidates=linear_L,
@@ -341,15 +341,15 @@ def test_flux_candidates_match_reference_cpu(use_local, use_anchors, use_dna):
         anchor_stride=anchor_stride,
         use_local=use_local,
         use_anchors=use_anchors,
-        dna_scores=dna_scores,
+        proto_scores=proto_scores,
     )
-    assert flux_candidates.shape == expected_candidates.shape
-    assert torch.equal(flux_candidates, expected_candidates)
-    assert torch.equal(flux_lengths, expected_lengths)
+    assert shortlist_candidates.shape == expected_candidates.shape
+    assert torch.equal(shortlist_candidates, expected_candidates)
+    assert torch.equal(shortlist_lengths, expected_lengths)
 
 
-@pytest.mark.parametrize("use_dna", [False, True])
-def test_build_packed_flux_candidates_matches_per_head(use_dna: bool) -> None:
+@pytest.mark.parametrize("use_proto", [False, True])
+def test_build_packed_shortlist_candidates_matches_per_head(use_proto: bool) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
 
@@ -377,11 +377,11 @@ def test_build_packed_flux_candidates_matches_per_head(use_dna: bool) -> None:
         use_anchors=True,
         local_cap=5,
         anchor_cap=6,
-        dna_cap=6,
+        proto_cap=6,
     )
 
-    if use_dna:
-        dna_scores = torch.rand(2, seq_len, device=device)
+    if use_proto:
+        proto_scores = torch.rand(2, seq_len, device=device)
         row_counts = rows_per_head.to(torch.long)
         head_range = torch.arange(active_heads, device=device, dtype=torch.long)
         row_head_ids = torch.repeat_interleave(head_range, row_counts)
@@ -389,14 +389,14 @@ def test_build_packed_flux_candidates_matches_per_head(use_dna: bool) -> None:
             device=device, dtype=torch.long
         )
     else:
-        dna_scores = None
+        proto_scores = None
         row_batch_ids = None
 
-    packed_candidates, packed_lengths = build_packed_flux_candidates(
+    packed_candidates, packed_lengths = build_packed_shortlist_candidates(
         token_idx,
         row_batch_ids,
         seq_len,
-        dna_scores=dna_scores,
+        proto_scores=proto_scores,
         **runtime_kwargs,
     )
 
@@ -407,14 +407,14 @@ def test_build_packed_flux_candidates_matches_per_head(use_dna: bool) -> None:
         start = int(row_offsets[head].item())
         end = int(row_offsets[head + 1].item())
         rows = token_idx[start:end]
-        dna_vec = None
-        if use_dna:
+        proto_vec = None
+        if use_proto:
             batch_index = int((head_indices[head] // h_total).item())
-            dna_vec = dna_scores[batch_index]
-        candidates, lengths = build_flux_candidates(
+            proto_vec = proto_scores[batch_index]
+        candidates, lengths = build_shortlist_candidates(
             rows,
             seq_len,
-            dna_scores=dna_vec,
+            proto_scores=proto_vec,
             **runtime_kwargs,
         )
         baseline_candidates[start:end] = candidates
@@ -484,9 +484,9 @@ def test_causal_dynamic_attention_linear_matches_dense_when_full_window():
     )
 
     torch.manual_seed(123)
-    attn_subquad = CausalDynamicAttention(cfg_subquad)
+    attn_subquad = AdaptiveSparseAttention(cfg_subquad)
     torch.manual_seed(123)
-    attn_linear = CausalDynamicAttention(cfg_linear)
+    attn_linear = AdaptiveSparseAttention(cfg_linear)
     attn_linear.load_state_dict(attn_subquad.state_dict())
 
     x = torch.randn(2, 32, cfg_linear.d_model)
@@ -499,19 +499,19 @@ def test_causal_dynamic_attention_linear_matches_dense_when_full_window():
     assert torch.allclose(out_lin, out_sub, atol=1e-5, rtol=1e-4)
     mode_label = attn_linear.last_head_stats.get("mode")
     sparse_mode = attn_linear._last_sparse_state.get("mode")
-    assert mode_label in {"linear", "flux"}
-    assert sparse_mode in {"linear", "flux"}
+    assert mode_label in {"linear", "shortlist"}
+    assert sparse_mode in {"linear", "shortlist"}
 
 
 @pytest.mark.parametrize(
-    ("policy", "anchor_stride", "dna_enabled", "expect_close"),
+    ("policy", "anchor_stride", "proto_enabled", "expect_close"),
     [
         ("local", 0, False, True),
         ("local+anchors", 4, False, True),
-        ("local+dna", 0, True, True),
+        ("local+proto", 0, True, True),
     ],
 )
-def test_causal_dynamic_attention_linear_policy_variants(policy, anchor_stride, dna_enabled, expect_close):
+def test_causal_dynamic_attention_linear_policy_variants(policy, anchor_stride, proto_enabled, expect_close):
     torch.manual_seed(7)
     base_kwargs = dict(
         vocab_size=40,
@@ -534,9 +534,9 @@ def test_causal_dynamic_attention_linear_policy_variants(policy, anchor_stride, 
 
     cfg_subquad = ModelConfig(
         attn_mode="subquad",
-        attn_dna_enable=dna_enabled,
-        attn_dna_threshold=0.0,
-        attn_dna_blend=1.0 if dna_enabled else 0.0,
+        attn_proto_enable=proto_enabled,
+        attn_proto_threshold=0.0,
+        attn_proto_blend=1.0 if proto_enabled else 0.0,
         **base_kwargs,
     )
     cfg_linear = ModelConfig(
@@ -546,16 +546,16 @@ def test_causal_dynamic_attention_linear_policy_variants(policy, anchor_stride, 
         attn_linear_anchor_stride=anchor_stride,
         attn_linear_policy=policy,
         attn_linear_head_k=4,
-        attn_dna_enable=dna_enabled,
-        attn_dna_threshold=0.0,
-        attn_dna_blend=1.0 if dna_enabled else 0.0,
+        attn_proto_enable=proto_enabled,
+        attn_proto_threshold=0.0,
+        attn_proto_blend=1.0 if proto_enabled else 0.0,
         **base_kwargs,
     )
 
     torch.manual_seed(7)
-    attn_subquad = CausalDynamicAttention(cfg_subquad)
+    attn_subquad = AdaptiveSparseAttention(cfg_subquad)
     torch.manual_seed(7)
-    attn_linear = CausalDynamicAttention(cfg_linear)
+    attn_linear = AdaptiveSparseAttention(cfg_linear)
     attn_linear.load_state_dict(attn_subquad.state_dict())
 
     x = torch.randn(2, 48, cfg_linear.d_model)
@@ -571,8 +571,8 @@ def test_causal_dynamic_attention_linear_policy_variants(policy, anchor_stride, 
         assert not torch.allclose(out_lin, out_sub, atol=1e-5, rtol=1e-4)
     mode_label = attn_linear.last_head_stats.get("mode")
     sparse_mode = attn_linear._last_sparse_state.get("mode")
-    assert mode_label in {"linear", "flux"}
-    assert sparse_mode in {"linear", "flux"}
+    assert mode_label in {"linear", "shortlist"}
+    assert sparse_mode in {"linear", "shortlist"}
     backend = attn_linear.last_head_stats.get("linear_shortlist_backend")
     assert backend in {"torch", "triton", "fallback_dense"}
 
@@ -596,7 +596,7 @@ def test_causal_dynamic_attention_latency_budget_auto_switch():
         attn_token_sparse=False,
     )
 
-    attn = CausalDynamicAttention(cfg)
+    attn = AdaptiveSparseAttention(cfg)
     attn._latency_ema = 5.0  # simulate high latency
     assert attn._select_mode(128) == "linear"
     attn._latency_ema = 0.0
@@ -692,8 +692,8 @@ def test_causal_dynamic_attention_quantized_path_matches_fp(mode, percentile):
     quant_kwargs["attn_quantize_int8_percentile"] = percentile
     quant_cfg = ModelConfig(**quant_kwargs)
 
-    attn_fp = CausalDynamicAttention(base_cfg)
-    attn_q = CausalDynamicAttention(quant_cfg)
+    attn_fp = AdaptiveSparseAttention(base_cfg)
+    attn_q = AdaptiveSparseAttention(quant_cfg)
     attn_q.load_state_dict(attn_fp.state_dict())
 
     attn_fp.eval()
@@ -730,7 +730,7 @@ def test_dmoah_active_head_schedule_respects_min_max_bounds():
         attn_active_seq_low=512,
         attn_active_seq_high=4096,
     )
-    attn = CausalDynamicAttention(cfg)
+    attn = AdaptiveSparseAttention(cfg)
 
     assert attn.h_active_curve == pytest.approx(0.25)
     assert attn._choose_active_k(64) == attn.h_active_max
@@ -783,8 +783,8 @@ def test_dmoah_sparse_attention_triton_gpu_matches_cpu():
         dropout_p=0.0,
         training=False,
         causal_mask=causal_mask,
-        flux_candidates=None,
-        flux_lengths=None,
+        shortlist_candidates=None,
+        shortlist_lengths=None,
     )
 
     out_gpu = dmoah_sparse_attention(

@@ -4,8 +4,8 @@
 
 from proteus_attention.models.dmoah import (
     ModelConfig,
-    AttentionBlock as DMoAH_AttentionBlock,
-    CausalDynamicAttention,
+    AdaptiveSparseAttentionBlock,
+    AdaptiveSparseAttention,
 )
 import argparse
 import json
@@ -30,7 +30,7 @@ sys.path.insert(0, str(project_root / 'src'))
 
 # ------------------------------------------------------------------------------
 # Repo-relative imports (your layout)
-# models/      -> dmoah.py (AttentionBlock, ModelConfig)
+# models/      -> dmoah.py (AdaptiveSparseAttentionBlock, ModelConfig)
 # kernels/     -> sparse_attn.py, tinytoy.py  (not required here, but present)
 # examples/    -> this script
 # ------------------------------------------------------------------------------
@@ -124,7 +124,7 @@ class StandardAttention(nn.Module):
         return self.dropout(self.proj(out))
 
 
-class StandardAttentionBlock(nn.Module):
+class StandardAdaptiveSparseAttentionBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int, p_dropout: float, bias: bool):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
@@ -160,11 +160,11 @@ class SimpleGPT(nn.Module):
         if model_type == "dmoah":
             for _ in range(config.n_layer):
                 # from models/dmoah.py
-                blocks.append(DMoAH_AttentionBlock(config))
+                blocks.append(AdaptiveSparseAttentionBlock(config))
         else:
             for _ in range(config.n_layer):
                 blocks.append(
-                    StandardAttentionBlock(
+                    StandardAdaptiveSparseAttentionBlock(
                         d_model=config.d_model,
                         n_head=getattr(config, "n_head", 8),
                         p_dropout=config.p_dropout,
@@ -240,7 +240,7 @@ def _iter_dmoah_layers(root: nn.Module):
             getattr(attn, "_orig_mod", None),
         )
         for candidate in candidates:
-            if isinstance(candidate, CausalDynamicAttention):
+            if isinstance(candidate, AdaptiveSparseAttention):
                 yield candidate
                 break
 
@@ -263,8 +263,8 @@ class _HeadStatsAggregator:
     def __init__(self) -> None:
         self._totals: dict[str, float] = {}
         self._counts: dict[str, int] = {}
-        self._dna_totals: dict[str, float] = {}
-        self._dna_counts: dict[str, int] = {}
+        self._proto_totals: dict[str, float] = {}
+        self._proto_counts: dict[str, int] = {}
 
     def update_from_model(self, model: nn.Module) -> None:
         for block in _iter_model_blocks(model):
@@ -272,11 +272,11 @@ class _HeadStatsAggregator:
             if not isinstance(stats, dict):
                 continue
             for key, value in stats.items():
-                if key not in self.INTEREST_KEYS and key != "dna":
+                if key not in self.INTEREST_KEYS and key != "proto":
                     continue
-                if key == "dna" and isinstance(value, dict):
+                if key == "proto" and isinstance(value, dict):
                     self._update_nested(
-                        value, self._dna_totals, self._dna_counts)
+                        value, self._proto_totals, self._proto_counts)
                     continue
                 if isinstance(value, (int, float)):
                     self._totals[key] = self._totals.get(
@@ -300,23 +300,23 @@ class _HeadStatsAggregator:
             ]
             if dense:
                 lines.append(" | ".join(dense))
-        if self._dna_totals:
-            dna = [
-                f"dna_{key}={self._dna_totals[key] / max(1, self._dna_counts[key]):.3f}"
-                for key in sorted(self._dna_totals)
-                if self._dna_counts.get(key, 0)
+        if self._proto_totals:
+            proto = [
+                f"proto_{key}={self._proto_totals[key] / max(1, self._proto_counts[key]):.3f}"
+                for key in sorted(self._proto_totals)
+                if self._proto_counts.get(key, 0)
             ]
-            if dna:
-                lines.append(" | ".join(dna))
+            if proto:
+                lines.append(" | ".join(proto))
         return lines
 
     def mean(self, key: str) -> Optional[float]:
         if key in self._totals and self._counts.get(key):
             return self._totals[key] / self._counts[key]
-        if key.startswith("dna_"):
-            raw = key[len("dna_"):]
-            if raw in self._dna_totals and self._dna_counts.get(raw):
-                return self._dna_totals[raw] / self._dna_counts[raw]
+        if key.startswith("proto_"):
+            raw = key[len("proto_"):]
+            if raw in self._proto_totals and self._proto_counts.get(raw):
+                return self._proto_totals[raw] / self._proto_counts[raw]
         return None
 
 
@@ -641,7 +641,7 @@ def main():
     parser.add_argument("--token_keep_min", type=int, default=8,
                         help="Minimum tokens to keep per sequence when token sparsity is enabled.")
     parser.add_argument("--token_keep_threshold", type=float, default=0.0,
-                        help="DNA/importance threshold for keeping tokens.")
+                        help="Proto/importance threshold for keeping tokens.")
     parser.add_argument("--token_keep_guard", type=int, default=1,
                         help="Always keep the first N tokens in each sequence.")
     parser.add_argument("--genetic_steps", type=int, default=0,
@@ -738,7 +738,7 @@ def main():
         attn_small_seq_dense=args.block_size // 2,
         attn_force_dense_threshold=dense_threshold,  # smooth the mid-seq wobble
         attn_gates=16,
-        attn_dna_enable=True,
+        attn_proto_enable=True,
         attn_quantize_int8=True,          # enable int8 path you benchmarked
         attn_token_sparse=token_sparse,
         attn_token_keep_ratio=token_keep_ratio,

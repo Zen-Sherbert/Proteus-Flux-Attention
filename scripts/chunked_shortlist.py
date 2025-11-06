@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """
-Professional-grade Chunked Flux CLI utility.
+Professional-grade Chunked Shortlist CLI utility.
 
-The tool exposes the reusable :mod:`proteus_attention.tools.chunked_flux`
+The tool exposes the reusable :mod:`proteus_attention.tools.chunked_shortlist`
 pipeline via a convenient command-line interface.  It can operate on synthetic
 sequences or on user-provided embeddings saved as ``.pt``/``.npy`` tensors.
 """
@@ -17,9 +17,9 @@ from typing import Optional
 
 import torch
 
-from proteus_attention.tools.chunked_flux import (
-    ChunkedFluxConfig,
-    ChunkedFluxRunner,
+from proteus_attention.tools.chunked_shortlist import (
+    ChunkedShortlistConfig,
+    ChunkedShortlistRunner,
 )
 
 try:  # pragma: no cover - optional dependency
@@ -44,7 +44,7 @@ def _load_sequence(path: Path, *, seq_len: int, d_model: int) -> torch.Tensor:
     if tensor.dim() != 3:
         raise ValueError(f"Input tensor must have shape (B, T, D); received {tensor.shape}.")
     if tensor.size(0) != 1:
-        raise ValueError("Chunked Flux currently expects a batch dimension of size 1.")
+        raise ValueError("Chunked Shortlist currently expects a batch dimension of size 1.")
     if tensor.size(1) < seq_len:
         raise ValueError(
             f"Input sequence length {tensor.size(1)} is smaller than requested seq_len={seq_len}."
@@ -68,7 +68,7 @@ def _save_report(path: Path, report: dict) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Chunked Flux pipeline utility.")
+    parser = argparse.ArgumentParser(description="Chunked Shortlist pipeline utility.")
     parser.add_argument("--seq-len", type=int, default=1_000_000, help="Total sequence length to process.")
     parser.add_argument("--d-model", type=int, default=512, help="Model width for embeddings.")
     parser.add_argument("--chunk-len", type=int, default=131_072, help="Tokens per streaming chunk.")
@@ -114,7 +114,7 @@ def main() -> None:
         sequence = _load_sequence(Path(args.input), seq_len=args.seq_len, d_model=args.d_model)
         logging.info("Loaded input tensor from %s", args.input)
 
-    config = ChunkedFluxConfig(
+    config = ChunkedShortlistConfig(
         seq_len=args.seq_len,
         d_model=args.d_model,
         chunk_len=args.chunk_len,
@@ -130,12 +130,12 @@ def main() -> None:
         run_final_pass=not args.no_final_pass,
     )
 
-    runner = ChunkedFluxRunner(config)
+    runner = ChunkedShortlistRunner(config)
     result = runner.run(sequence=sequence)
     metrics = result.metrics
 
     logging.info(
-        "Chunked Flux complete: retained %s/%s tokens (%.2f%%) on %s",
+        "Chunked Shortlist complete: retained %s/%s tokens (%.2f%%) on %s",
         metrics.retained_tokens,
         metrics.original_tokens,
         metrics.retention_ratio * 100.0,

@@ -4,7 +4,7 @@ One-shot helper to autotune the Triton block sizes for the Proteus Attention ker
 
 Running this script will execute a single forward pass on random data to trigger the
 automatic tuner and persist the discovered configuration in the cache directory
-(`~/.cache/proteus_attention/flux_block_config.json` by default). Subsequent runs on
+(`~/.cache/proteus_attention/shortlist_block_config.json` by default). Subsequent runs on
 the same GPU will reuse the cached settings automatically.
 """
 

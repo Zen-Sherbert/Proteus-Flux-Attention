@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """
-Quick smoke-test CLI for the Chunked Flux pipeline.
+Quick smoke-test CLI for the Chunked Shortlist pipeline.
 
 The goal is to provide a minimal command that runs the reusable
-``ChunkedFluxRunner`` with synthetic data so users can sanity check their
+``ChunkedShortlistRunner`` with synthetic data so users can sanity check their
 environment before launching heavier benchmarks.
 """
 from __future__ import annotations
@@ -14,15 +14,15 @@ from pathlib import Path
 import os
 import torch
 
-from proteus_attention.tools.chunked_flux import (
-    ChunkedFluxConfig,
-    ChunkedFluxRunner,
+from proteus_attention.tools.chunked_shortlist import (
+    ChunkedShortlistConfig,
+    ChunkedShortlistRunner,
 )
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a lightweight Chunked Flux smoke test."
+        description="Run a lightweight Chunked Shortlist smoke test."
     )
     parser.add_argument(
         "--seq-len",
@@ -119,7 +119,7 @@ def main() -> None:
     os.environ.setdefault("PROTEUS_TUNE_DISABLE", "1")
     device = _resolve_device(args.device)
 
-    config = ChunkedFluxConfig(
+    config = ChunkedShortlistConfig(
         seq_len=args.seq_len,
         d_model=args.d_model,
         chunk_len=args.chunk_len,
@@ -137,11 +137,11 @@ def main() -> None:
         temp_dir=args.temp_dir,
     )
 
-    runner = ChunkedFluxRunner(config)
+    runner = ChunkedShortlistRunner(config)
     result = runner.run()
     metrics = result.metrics
 
-    print("\n=== Chunked Flux Smoke Test ===")
+    print("\n=== Chunked Shortlist Smoke Test ===")
     print(f"device              : {metrics.device}")
     print(f"sequence length     : {metrics.original_tokens}")
     print(f"retained tokens     : {metrics.retained_tokens} ({metrics.retention_ratio:.2%})")
