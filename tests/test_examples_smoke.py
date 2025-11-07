@@ -40,7 +40,6 @@ def test_train_baseline_smoke(tmp_path, monkeypatch):
         batch_size=2,
         lr=1e-3,
         device=torch.device("cpu"),
-        prompt="hello",
         sample_tokens=4,
         data_path=data,
     )
@@ -56,7 +55,6 @@ def test_train_dense_baseline_smoke(tmp_path, monkeypatch):
         batch_size=2,
         lr=1e-3,
         device=torch.device("cpu"),
-        prompt="dense",
         sample_tokens=4,
         data_path=data,
     )
@@ -75,7 +73,6 @@ def test_train_context_slide_smoke(tmp_path, monkeypatch):
         lr=1e-3,
         device=torch.device("cpu"),
         data_path=data,
-        prompt="context",
         sample_tokens=4,
     )
     assert "checkpoint" in result
@@ -98,7 +95,6 @@ def test_train_context_mastery_smoke(tmp_path, monkeypatch):
         plateau_patience=1,
         plateau_cooldown=1,
         data_path=data,
-        prompt="mastery",
         sample_tokens=4,
     )
     assert "checkpoint" in result

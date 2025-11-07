@@ -71,10 +71,18 @@ def benchmark_forward_pass(model, x, num_runs=50):
     x = x.to(device)
 
     seq_len = int(x.shape[1]) if x.dim() >= 2 else 0
-    if seq_len >= 16384:
-        warmup_runs = 0
-    elif seq_len >= 8192:
+    if seq_len >= 524288:
         warmup_runs = 1
+    elif seq_len >= 131072:
+        warmup_runs = 1
+    elif seq_len >= 65536:
+        warmup_runs = 1
+    elif seq_len >= 32768:
+        warmup_runs = 1
+    elif seq_len >= 16384:
+        warmup_runs = 2
+    elif seq_len >= 8192:
+        warmup_runs = 5
     else:
         warmup_runs = 10
 
@@ -460,6 +468,8 @@ def _prepare_dmoah_config(
     )
     if memory_guard:
         config = _apply_memory_saving_overrides(config, seq_len)
+    dense_cut = 0.35 if seq_len <= 2048 else 0.20
+    setattr(config, "attn_dense_alpha_cutoff", dense_cut)
     return config
 
 
@@ -483,6 +493,32 @@ def _effective_batch_size(seq_len: int, base_batch_size: int) -> int:
     if seq_len >= 8192:
         return 1
     return max(1, min(base_batch_size, 4))
+
+
+def _parse_mode_label(value: object) -> tuple[str, Optional[float]]:
+    """
+    Extract human-readable mode and optional CVT alpha from the telemetry string.
+    """
+    if value is None:
+        return "-", None
+    text = str(value).strip()
+    if not text:
+        return "-", None
+    alpha: Optional[float] = None
+    mode = text
+    if "::" in text:
+        prefix, mode = text.split("::", 1)
+        mode = mode.strip() or mode
+        prefix = prefix.strip()
+        if prefix.startswith("cvt(") and "alpha=" in prefix:
+            start = prefix.find("alpha=") + len("alpha=")
+            end = prefix.find(")", start)
+            snippet = prefix[start:end if end != -1 else None].strip()
+            try:
+                alpha = float(snippet)
+            except (TypeError, ValueError):
+                alpha = None
+    return mode or "-", alpha
 
 
 def _instantiate_dmoah_model(
@@ -552,8 +588,6 @@ def _prime_linear_mode(
         memory_guard=memory_guard,
         allow_sdpa_fastpath=allow_sdpa_fastpath,
     )
-    config.attn_mode = "linear"
-    config.attn_linear_switch_ctx = 1
     setattr(config, "attn_track_latency", False)
     model = AdaptiveSparseAttention(config)
     if hasattr(model, "set_shortlist_alpha"):
@@ -567,6 +601,58 @@ def _prime_linear_mode(
     del model
     _LINEAR_WARM_STATE.add(key)
 
+
+def _prewarm_shortlist_kernels(
+    *,
+    device: torch.device,
+    sequence_lengths: list[int],
+    seq_high: int,
+    d_model: int,
+    base_batch_size: int,
+    variant_configs: list[tuple[str, bool, str]],
+    memory_guard: bool,
+    allow_sdpa_fastpath: bool,
+) -> None:
+    """
+    Trigger Triton JIT/autotune for every (seq_len, variant) combination before timing.
+    """
+    if device.type != "cuda":
+        return
+
+    for _, quantize, _ in variant_configs:
+        for seq_len in sequence_lengths:
+            batch_eff = _effective_batch_size(seq_len, base_batch_size)
+            input_tensor = torch.randn(
+                batch_eff,
+                seq_len,
+                d_model,
+                device=device,
+                dtype=torch.get_default_dtype(),
+            )
+            config = _prepare_dmoah_config(
+                seq_len,
+                seq_high,
+                d_model=d_model,
+                quantize=quantize,
+                memory_guard=memory_guard,
+                allow_sdpa_fastpath=allow_sdpa_fastpath,
+            )
+            setattr(config, "attn_track_latency", False)
+            model = AdaptiveSparseAttention(config)
+            if hasattr(model, "set_shortlist_alpha"):
+                seq_low_cfg = int(getattr(config, "attn_active_seq_low", 256) or 256)
+                switch_ctx_cfg = int(getattr(config, "attn_linear_switch_ctx", 8192) or 8192)
+                alpha = _shortlist_alpha_from_seq(
+                    seq_len=seq_len,
+                    seq_low=seq_low_cfg,
+                    switch_ctx=switch_ctx_cfg,
+                )
+                model.set_shortlist_alpha(alpha)
+            model.to(device)
+            with torch.inference_mode():
+                _ = model(input_tensor)
+            del model
+            torch.cuda.synchronize(device)
 
 def estimate_safe_length(label: str,
                          sequence_lengths: list[int],
@@ -974,10 +1060,18 @@ def main(argv: list[str] | None = None) -> None:
         if chunked_shortlist_enabled:
             safe_chunked_shortlist = max(sequence_lengths)
 
+    if not chunked_shortlist_enabled:
+        sequence_lengths = [seq for seq in sequence_lengths if seq <= 524288]
+
     runs_summary: list[dict[str, object]] = []
 
-    print(f"{'Seq Len':<10} | {'Model':<24} | {'Latency (ms)':<15} | {'Seq/s':<12} | {'Tok/s':<15} | {'Memory (MB)':<15} | {'Active K':<10} | {'Tokens':<10} | {'Mode':<10} | {'Backend':<36}")
-    print("-" * 212)
+    header = (
+        f"{'Seq Len':<10} | {'Model':<24} | {'Latency (ms)':<15} | {'Seq/s':<12} | "
+        f"{'Tok/s':<15} | {'Memory (MB)':<15} | {'Active K':<10} | {'Tokens':<10} | "
+        f"{'Alpha':<7} | {'Mode':<16} | {'Backend':<36}"
+    )
+    print(header)
+    print("-" * len(header))
 
     std_limit_announced = False
     last_std_success = None
@@ -1004,6 +1098,17 @@ def main(argv: list[str] | None = None) -> None:
                 memory_guard=args.memory_guard,
                 allow_sdpa_fastpath=allow_sdpa_fastpath,
             )
+    if device.type == 'cuda':
+        _prewarm_shortlist_kernels(
+            device=device,
+            sequence_lengths=sequence_lengths,
+            seq_high=seq_high,
+            d_model=D_MODEL,
+            base_batch_size=BASE_BATCH_SIZE,
+            variant_configs=variant_configs,
+            memory_guard=args.memory_guard,
+            allow_sdpa_fastpath=allow_sdpa_fastpath,
+        )
     dmoah_limit_announced = {key: False for _, _, key in variant_configs}
     variant_active = {key: True for _, _, key in variant_configs}
     variant_last_success = {key: None for _, _, key in variant_configs}
@@ -1042,6 +1147,7 @@ def main(argv: list[str] | None = None) -> None:
             "batch_size": batch_eff,
         }
         baseline_success = False
+        std_alpha = "-"
         if run_standard:
             model_std = StandardAttention(config_standard)
             latency_std = benchmark_forward_pass(model_std, input_tensor)
@@ -1062,6 +1168,8 @@ def main(argv: list[str] | None = None) -> None:
                 "tokens_per_s": tokens_std,
                 "memory_mb": mem_std,
                 "status": "ok",
+                "mode": "-",
+                "shortlist_alpha": None,
             })
         else:
             std_latency = f"{'OOM':<15}"
@@ -1076,6 +1184,8 @@ def main(argv: list[str] | None = None) -> None:
                 "tokens_per_s": None,
                 "memory_mb": None,
                 "status": "limit",
+                "mode": "-",
+                "shortlist_alpha": None,
             })
             if not std_limit_announced:
                 hit_at = seq_len
@@ -1087,7 +1197,9 @@ def main(argv: list[str] | None = None) -> None:
             std_tokens = f"{tokens_std:<15.2f}"
             std_mode = "-"
         print(
-            f"{seq_len:<10} | {'Standard Attention':<24} | {std_latency} | {std_throughput} | {std_tokens} | {std_mem} | {'-':<10} | {'-':<10} | {std_mode:<10} | {std_backend:<36}"
+            f"{seq_len:<10} | {'Standard Attention':<24} | {std_latency} | "
+            f"{std_throughput} | {std_tokens} | {std_mem} | {'-':<10} | {'-':<10} | "
+            f"{std_alpha:<7} | {std_mode:<16} | {std_backend:<36}"
         )
         runs_summary.append(std_record)
 
@@ -1116,7 +1228,9 @@ def main(argv: list[str] | None = None) -> None:
             backend_display = "dmoah-skip"
             active_k_display = "-"
             token_keep_display = "-"
-            mode_display = mode_setting
+            alpha_display = "-"
+            mode_display = "-"
+            alpha_value: float | None = None
             if run_variant:
                 model_dmoah, config_dmoah, alpha_override = _instantiate_dmoah_model(
                     seq_len,
@@ -1128,6 +1242,7 @@ def main(argv: list[str] | None = None) -> None:
                     device=device,
                 )
                 mode_setting = getattr(config_dmoah, "attn_mode", "auto")
+                mode_display = mode_setting
                 shortlist_alpha = alpha_override
                 if shortlist_alpha is None:
                     seq_low_cfg = int(
@@ -1162,7 +1277,7 @@ def main(argv: list[str] | None = None) -> None:
                             dmoah_limit_announced[variant_key] = True
                     else:
                         raise
-
+                shortlist_alpha_val = shortlist_alpha
                 if status == "ok":
                     backend_info = get_last_backend_info()
                     backend_name = str(backend_info.get('name', 'unknown'))
@@ -1196,7 +1311,7 @@ def main(argv: list[str] | None = None) -> None:
                         proto_stats = last_stats.get('proto') or last_stats.get('dna')
                     token_keep = last_stats.get('token_keep_fraction') if isinstance(
                         last_stats, dict) else None
-                    shortlist_alpha_val = last_stats.get("shortlist_alpha", shortlist_alpha)
+                    shortlist_alpha_val = last_stats.get("shortlist_alpha", shortlist_alpha_val)
                     parts: list[str] = []
                     if max_rows is not None:
                         parts.append(f"max_rows={int(max_rows)}")
@@ -1223,8 +1338,12 @@ def main(argv: list[str] | None = None) -> None:
                     active_k_display = "-" if target_k is None else f"{int(target_k)}"
                     token_keep_display = "-" if token_keep is None else f"{token_keep:.2f}"
                     variant_last_success[variant_key] = seq_len
-                    mode_display = str(last_stats.get('mode_selected') or last_stats.get(
-                        'mode') or mode_setting or 'unknown')
+                    mode_raw = last_stats.get('mode_selected') or last_stats.get(
+                        'mode') or mode_setting or 'unknown'
+                    mode_display, alpha_from_mode = _parse_mode_label(mode_raw)
+                    if shortlist_alpha_val is None:
+                        shortlist_alpha_val = alpha_from_mode
+                    alpha_value = shortlist_alpha_val
                     tokens_per_s = throughput * seq_len if throughput is not None else None
                 else:
                     backend_display = "dmoah-limit"
@@ -1232,11 +1351,14 @@ def main(argv: list[str] | None = None) -> None:
                     token_keep_display = "-"
                     token_keep = None
                     target_k = None
-                    mode_display = mode_setting if run_variant else "-"
+                    alpha_value = shortlist_alpha
                     tokens_per_s = None
                 del model_dmoah
             else:
                 shortlist_backend = None
+                alpha_value = None
+
+            alpha_display = "-" if alpha_value is None else f"{alpha_value:.2f}"
 
             display_latency = f"{latency:<15.2f}" if latency is not None else f"{'OOM':<15}"
             display_throughput = f"{throughput:<12.2f}" if throughput is not None else f"{'-':<12}"
@@ -1245,7 +1367,8 @@ def main(argv: list[str] | None = None) -> None:
 
             print(
                 f"{seq_len:<10} | {variant_label:<24} | {display_latency} | "
-                f"{display_throughput} | {display_tokens} | {display_memory} | {active_k_display:<10} | {token_keep_display:<10} | {mode_display:<10} | {backend_display:<36}"
+                f"{display_throughput} | {display_tokens} | {display_memory} | {active_k_display:<10} | {token_keep_display:<10} | "
+                f"{alpha_display:<7} | {mode_display:<16} | {backend_display:<36}"
             )
             record.update({
                 "latency_ms": latency,
@@ -1263,7 +1386,7 @@ def main(argv: list[str] | None = None) -> None:
                 "linear_L_anchor_cap": last_stats.get("linear_L_anchor_cap"),
                 "linear_L_proto_cap": last_stats.get("linear_L_proto_cap")
                 or last_stats.get("linear_L_dna_cap"),
-                "shortlist_alpha": None if shortlist_alpha is None else float(shortlist_alpha),
+                "shortlist_alpha": None if alpha_value is None else float(alpha_value),
             })
             if status == "ok":
                 auto_log = {
@@ -1287,7 +1410,7 @@ def main(argv: list[str] | None = None) -> None:
                     "linear_L_anchor_cap": last_stats.get("linear_L_anchor_cap"),
                     "linear_L_proto_cap": last_stats.get("linear_L_proto_cap")
                     or last_stats.get("linear_L_dna_cap"),
-                    "shortlist_alpha": float(shortlist_alpha),
+                    "shortlist_alpha": None if alpha_value is None else float(alpha_value),
                 }
                 auto_logs.append(auto_log)
                 print(
@@ -1298,7 +1421,8 @@ def main(argv: list[str] | None = None) -> None:
                         f"[Notice] {variant_label} skipping seq_len={seq_len} due to limit.")
                     dmoah_limit_announced[variant_key] = True
                 print(
-                    f"{seq_len:<10} | {variant_label:<24} | {'OOM':<15} | {'-':<12} | {'-':<15} | {'-':<15} | {'-':<10} | {'-':<10} | {'-':<10} | {'dmoah-limit':<36}"
+                    f"{seq_len:<10} | {variant_label:<24} | {'OOM':<15} | {'-':<12} | {'-':<15} | {'-':<15} | "
+                    f"{'-':<10} | {'-':<10} | {'-':<7} | {'-':<16} | {'dmoah-limit':<36}"
                 )
                 record.update({
                     "latency_ms": None,
@@ -1308,8 +1432,9 @@ def main(argv: list[str] | None = None) -> None:
                     "active_k": None,
                     "token_fraction": None,
                     "backend": "dmoah-limit",
-                    "mode": mode_setting if run_variant else None,
+                    "mode": "-" if run_variant else None,
                     "status": "limit",
+                    "shortlist_alpha": None,
                 })
 
             variant_status_map[variant_key] = status
@@ -1374,7 +1499,8 @@ def main(argv: list[str] | None = None) -> None:
                             print(f"[Notice] Chunked Shortlist hit its limit at seq_len={seq_len} (last safe ~{info}).")
                             chunked_shortlist_limit_announced = True
                         print(
-                            f"{seq_len:<10} | {'DMoAH + Chunked Shortlist':<24} | {'OOM':<15} | {'-':<12} | {'-':<15} | {'-':<15} | {'-':<10} | {'-':<10} | {'-':<10} | {'chunked_shortlist-limit':<36}"
+                            f"{seq_len:<10} | {'DMoAH + Chunked Shortlist':<24} | {'OOM':<15} | {'-':<12} | {'-':<15} | {'-':<15} | "
+                            f"{'-':<10} | {'-':<10} | {'-':<7} | {'-':<16} | {'chunked_shortlist-limit':<36}"
                         )
                     else:
                         raise
@@ -1405,7 +1531,12 @@ def main(argv: list[str] | None = None) -> None:
                         target_k = final_stats.get("target_k") or final_stats.get("top_k")
                     active_k_display = "-" if target_k is None else f"{int(target_k)}"
                     token_keep_display = f"{retention:.2f}" if retention is not None else "-"
-                    mode_display = str(final_stats.get("mode_selected") or final_stats.get("mode") or "chunked_shortlist")
+                    mode_raw = final_stats.get("mode_selected") or final_stats.get("mode") or "chunked_shortlist"
+                    mode_display, alpha_from_mode = _parse_mode_label(mode_raw)
+                    alpha_value = alpha_from_mode
+                    if alpha_value is None:
+                        alpha_value = float(args.shortlist_chunk_alpha) if args.shortlist_chunk_alpha is not None else None
+                    alpha_display = "-" if alpha_value is None else f"{alpha_value:.2f}"
                     display_latency = f"{latency:<15.2f}" if latency else f"{'-':<15}"
                     display_throughput = f"{throughput:<12.2f}" if throughput is not None else f"{'-':<12}"
                     display_tokens = f"{tokens_per_s:<15.2f}" if tokens_per_s is not None else f"{'-':<15}"
@@ -1414,7 +1545,8 @@ def main(argv: list[str] | None = None) -> None:
                     if len(backend_display_print) > 36:
                         backend_display_print = backend_display_print[:33] + "..."
                     print(
-                        f"{seq_len:<10} | {'DMoAH + Chunked Shortlist':<24} | {display_latency} | {display_throughput} | {display_tokens} | {display_memory} | {active_k_display:<10} | {token_keep_display:<10} | {mode_display:<10} | {backend_display_print:<36}"
+                        f"{seq_len:<10} | {'DMoAH + Chunked Shortlist':<24} | {display_latency} | {display_throughput} | {display_tokens} | "
+                        f"{display_memory} | {active_k_display:<10} | {token_keep_display:<10} | {alpha_display:<7} | {mode_display:<16} | {backend_display_print:<36}"
                     )
                     record_shortlist.update({
                         "latency_ms": latency,
@@ -1427,6 +1559,7 @@ def main(argv: list[str] | None = None) -> None:
                         "chunked_shortlist_backend": backend_name,
                         "mode": mode_display,
                         "status": "ok",
+                        "shortlist_alpha": alpha_value,
                         "chunked_shortlist_chunk_time_ms": metrics.chunk_time_ms,
                         "chunked_shortlist_final_time_ms": metrics.final_time_ms,
                         "chunked_shortlist_retained_tokens": metrics.retained_tokens,
@@ -1449,14 +1582,14 @@ def main(argv: list[str] | None = None) -> None:
                         "final_time_ms": metrics.final_time_ms,
                         "retained_tokens": metrics.retained_tokens,
                         "used_fallback": metrics.used_fallback,
-                        "shortlist_alpha": args.shortlist_chunk_alpha,
+                        "shortlist_alpha": alpha_value,
                     })
                     chunked_shortlist_last_success = seq_len
                     del shortlist_result
                     del shortlist_runner
                 runs_summary.append(record_shortlist)
 
-        print("-" * 212)
+        print("-" * len(header))
 
     if device.type == 'cuda':
         std_msg = safe_std if safe_std is not None else "none"

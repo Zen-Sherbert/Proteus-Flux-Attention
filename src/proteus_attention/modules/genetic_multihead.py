@@ -68,6 +68,7 @@ class CausalGeneticMultiheadAttention(nn.Module):
             "attn_quantize_int8_mode": config_overrides.pop("attn_quantize_int8_mode", "max"),
             "attn_quantize_int8_percentile": config_overrides.pop("attn_quantize_int8_percentile", 1.0),
             "attn_quantize_int8_ema_decay": config_overrides.pop("attn_quantize_int8_ema_decay", 0.9),
+            "attn_router_top_p": config_overrides.pop("attn_router_top_p", 0.9),
         }
         cfg.update(config_overrides)
 

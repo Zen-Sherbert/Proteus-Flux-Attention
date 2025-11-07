@@ -499,8 +499,8 @@ def test_causal_dynamic_attention_linear_matches_dense_when_full_window():
     assert torch.allclose(out_lin, out_sub, atol=1e-5, rtol=1e-4)
     mode_label = attn_linear.last_head_stats.get("mode")
     sparse_mode = attn_linear._last_sparse_state.get("mode")
-    assert mode_label in {"linear", "shortlist"}
-    assert sparse_mode in {"linear", "shortlist"}
+    assert mode_label == "shortlist"
+    assert sparse_mode == "shortlist"
 
 
 @pytest.mark.parametrize(
@@ -598,10 +598,12 @@ def test_causal_dynamic_attention_latency_budget_auto_switch():
 
     attn = AdaptiveSparseAttention(cfg)
     attn._latency_ema = 5.0  # simulate high latency
-    assert attn._select_mode(128) == "linear"
+    alpha_high = attn._compute_cvt_alpha(128)
+    assert pytest.approx(alpha_high, rel=0.0, abs=1e-6) == 1.0
     attn._latency_ema = 0.0
-    attn._current_mode = "linear"
-    assert attn._select_mode(64) == "subquad"
+    attn._current_alpha = 1.0
+    alpha_low = attn._compute_cvt_alpha(64)
+    assert pytest.approx(alpha_low, rel=0.0, abs=1e-6) == 0.0
 
 
 def test_gpt_dmoah_matches_dense_when_all_heads_active():

@@ -92,6 +92,7 @@ def _build_model_config(
     heads: int,
     sparse_ratio: float,
     shortlist_alpha: float,
+    router_top_p: float,
 ) -> ModelConfig:
     """Return a minimal ``ModelConfig`` tuned for chunked sparsity."""
 
@@ -132,6 +133,7 @@ def _build_model_config(
         attn_small_seq_dense=0,
         use_sdpa=False,
         attn_shortlist_alpha=shortlist_alpha,
+        attn_router_top_p=router_top_p,
     )
 
 
@@ -140,10 +142,14 @@ def _select_top_tokens(
     global_offset: int,
     *,
     per_chunk_budget: int,
+    nucleus_top_p: float,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Return ``(scores, indices)`` tensors for the top tokens in the chunk."""
 
     importance = getattr(model, "_last_token_importance", None)
+    if importance is not None and getattr(importance, "device", None) is not None:
+        if importance.device.type != "cuda":
+            importance = None
     if importance is None:
         return None
     scores = importance.squeeze(0).to(torch.float32)
@@ -154,16 +160,52 @@ def _select_top_tokens(
             scores,
             torch.full_like(scores, float("-inf")),
         )
-    top_k = min(per_chunk_budget, int(scores.size(-1)))
-    if top_k <= 0:
+    selection = _nucleus_select(scores, per_chunk_budget, nucleus_top_p)
+    if selection is None:
         return None
-    values, indices = torch.topk(scores, k=top_k)
+    values, indices = selection
     finite_mask = torch.isfinite(values)
     if not torch.any(finite_mask):
         return None
     values = values[finite_mask]
     indices = indices[finite_mask] + int(global_offset)
     return values, indices
+
+
+def _nucleus_select(
+    scores: torch.Tensor,
+    max_tokens: int,
+    top_p: float,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Return values/indices selected via nucleus (top-p) filtering."""
+
+    if scores.ndim != 1:
+        raise ValueError("scores tensor must be 1-D for nucleus selection.")
+    limit = min(max_tokens, int(scores.size(-1)))
+    if limit <= 0:
+        return None
+    finite_mask = torch.isfinite(scores)
+    if not torch.any(finite_mask):
+        return None
+    safe_scores = scores.clone()
+    safe_scores[~finite_mask] = -1e9
+    order = torch.argsort(safe_scores, descending=True)
+    ordered_scores = safe_scores[order]
+    probs = torch.softmax(safe_scores, dim=-1)
+    ordered_probs = probs[order]
+    if top_p >= 1.0:
+        keep = limit
+    else:
+        mass = torch.cumsum(ordered_probs, dim=-1)
+        cutoff = torch.tensor(float(top_p), device=scores.device, dtype=scores.dtype)
+        keep = int((mass < cutoff).sum().item())
+        if keep < ordered_scores.numel():
+            keep += 1
+        keep = max(1, keep)
+    keep = min(limit, keep)
+    selected = order[:keep]
+    selected_scores = scores[selected]
+    return selected_scores, selected
 
 
 def _finalise_indices(
@@ -280,6 +322,7 @@ class ChunkedShortlistConfig:
     per_chunk_budget: int
     device: torch.device
     heads: int = 8
+    nucleus_top_p: float = 0.9
     chunk_sparse_ratio: float = 0.05
     final_sparse_ratio: float = 0.5
     seed: Optional[int] = 7
@@ -309,6 +352,8 @@ class ChunkedShortlistConfig:
             raise ValueError("buffer_tokens must be positive.")
         if self.per_chunk_budget <= 0:
             raise ValueError("per_chunk_budget must be positive.")
+        if not (0.0 < float(self.nucleus_top_p) <= 1.0):
+            raise ValueError("nucleus_top_p must be within (0, 1].")
         if self.chunk_sparse_ratio <= 0.0:
             raise ValueError("chunk_sparse_ratio must be positive.")
         if self.final_sparse_ratio <= 0.0:
@@ -520,6 +565,7 @@ class ChunkedShortlistRunner:
             heads=cfg.heads,
             sparse_ratio=cfg.chunk_sparse_ratio,
             shortlist_alpha=cfg.shortlist_alpha,
+            router_top_p=cfg.nucleus_top_p,
         )
         chunk_model = AdaptiveSparseAttention(chunk_cfg).to(
             device=device, dtype=base_dtype
@@ -581,16 +627,21 @@ class ChunkedShortlistRunner:
                     chunk_model,
                     start,
                     per_chunk_budget=cfg.per_chunk_budget,
+                    nucleus_top_p=cfg.nucleus_top_p,
                 )
                 if promoted is None:
                     # Fallback: derive importance from token norms when the router
                     # does not expose explicit scores (common on CPU back-ends).
                     token_slice = chunk_tensor[0, :current_len].detach()
                     fallback_scores = token_slice.norm(dim=-1).to(torch.float32)
-                    top_k = min(cfg.per_chunk_budget, fallback_scores.numel())
-                    if top_k == 0:
+                    selection = _nucleus_select(
+                        fallback_scores,
+                        cfg.per_chunk_budget,
+                        cfg.nucleus_top_p,
+                    )
+                    if selection is None:
                         continue
-                    values, rel_indices = torch.topk(fallback_scores, k=top_k)
+                    values, rel_indices = selection
                     indices_tensor = rel_indices.to(torch.long) + start
                     scores_tensor = values
                     used_fallback = True
@@ -664,6 +715,7 @@ class ChunkedShortlistRunner:
                     heads=cfg.heads,
                     sparse_ratio=cfg.final_sparse_ratio,
                     shortlist_alpha=cfg.shortlist_alpha,
+                    router_top_p=cfg.nucleus_top_p,
                 )
                 final_model = AdaptiveSparseAttention(final_cfg).to(
                     device=device, dtype=base_dtype

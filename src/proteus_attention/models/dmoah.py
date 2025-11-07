@@ -59,6 +59,7 @@ class ModelConfig:
         "attn_linear_policy": "local+anchors",
         "attn_use_rope": True,
         "attn_rope_base": 10000.0,
+        "attn_router_top_p": 0.9,
     }
 
     def __init__(self, **kwargs: Any) -> None:
@@ -252,6 +253,15 @@ class AdaptiveSparseAttention(nn.Module):
             getattr(config, "attn_router_beta", 1.0) or 1.0)
         self.router_reg_mode = str(
             getattr(config, "attn_router_reg_mode", "entropy"))
+        router_top_p_cfg = getattr(config, "attn_router_top_p", 0.0)
+        try:
+            router_top_p = float(router_top_p_cfg)
+        except (TypeError, ValueError):
+            router_top_p = 0.0
+        if not math.isfinite(router_top_p):
+            router_top_p = 0.0
+        router_top_p = max(0.0, min(router_top_p, 1.0))
+        self.router_top_p = router_top_p
         raw_mode = str(getattr(config, "attn_mode", "auto") or "auto").lower()
         if raw_mode not in {"auto", "subquad", "linear"}:
             raw_mode = "auto"
@@ -366,7 +376,42 @@ class AdaptiveSparseAttention(nn.Module):
                 0.0, 1.0 - self.linear_piece_local_frac - self.linear_piece_anchor_frac)
         self._linear_runtime: Optional[dict] = None
         self._linear_runtime_seq_len: Optional[int] = None
-        self._current_mode: str = "subquad"
+        self._linear_runtime_alpha: Optional[float] = None
+        self._current_alpha: float = 0.0
+        cutoff_raw = getattr(config, "attn_dense_alpha_cutoff", 0.0)
+        try:
+            cutoff_val = float(cutoff_raw)
+        except (TypeError, ValueError):
+            cutoff_val = 0.25
+        self.dense_alpha_cutoff = float(max(0.0, min(0.95, cutoff_val)))
+        self.memory_enabled = bool(getattr(config, "attn_memory_enable", False))
+        memory_slots = int(getattr(config, "attn_memory_slots", 0) or 0)
+        if memory_slots <= 0:
+            self.memory_enabled = False
+            memory_slots = 1
+        self.memory_slots = int(memory_slots)
+        memory_decay = float(getattr(config, "attn_memory_decay", 0.9) or 0.9)
+        self.memory_decay = float(max(0.0, min(1.0, memory_decay)))
+        self.register_buffer(
+            "memory_keys",
+            torch.zeros(self.h_total, self.memory_slots, self.d_head, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "memory_values",
+            torch.zeros(self.h_total, self.memory_slots, self.d_head, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "memory_counts",
+            torch.zeros(self.h_total, self.memory_slots, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "memory_ptr",
+            torch.zeros(self.h_total, dtype=torch.long),
+            persistent=False,
+        )
         self.quantize_sparse_int8 = bool(
             getattr(config, "attn_quantize_int8", False))
         quant_mode = str(
@@ -513,8 +558,11 @@ class AdaptiveSparseAttention(nn.Module):
         self._last_token_mask: Optional[torch.Tensor] = None
         self._last_token_blend: Optional[torch.Tensor] = None
         self._last_token_similarity: Optional[torch.Tensor] = None
+        # --- Top-A sampler support ---
+        # Captures head-only consensus vectors so the sampler can enforce Agreement filtering/blending.
         self._last_shortlist_backend_info: Optional[Dict[str, object]] = None
         self._last_batch_size: Optional[int] = None
+        self.last_head_consensus: Optional[torch.Tensor] = None
 
     @staticmethod
     def _rope_rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -696,6 +744,39 @@ class AdaptiveSparseAttention(nn.Module):
         self._last_target_k = target
         return target
 
+    def _nucleus_head_count(
+        self,
+        head_probs: torch.Tensor,
+        target_p: float,
+        max_cap: int,
+    ) -> int:
+        """
+        Estimate the number of heads required to cover ``target_p`` probability mass.
+        """
+
+        if max_cap <= 1:
+            return max(1, max_cap)
+        probs = head_probs.detach().to(torch.float32)
+        if probs.numel() == 0:
+            return 1
+        mean_probs = probs.mean(dim=(0, 1))
+        if mean_probs.numel() == 0:
+            return 1
+        mean_probs = torch.where(
+            torch.isfinite(mean_probs), mean_probs, torch.zeros_like(mean_probs)
+        )
+        total_mass = float(mean_probs.sum().item())
+        if total_mass <= 0.0:
+            return 1
+        sorted_vals, _ = torch.sort(mean_probs, descending=True)
+        cumulative = torch.cumsum(sorted_vals, dim=0)
+        target_mass = total_mass * float(target_p)
+        keep = int((cumulative < target_mass).sum().item())
+        if keep < sorted_vals.numel():
+            keep += 1
+        keep = max(1, keep)
+        return min(max_cap, keep)
+
     def _update_density(self, value: float) -> None:
         value = float(max(0.0, value))
         self._last_density = value
@@ -767,6 +848,7 @@ class AdaptiveSparseAttention(nn.Module):
         self._linear_L_scale_runtime = float(
             min(max(value, min_scale), max_scale))
         self._linear_runtime_seq_len = None
+        self._linear_runtime_alpha = None
 
     def adjust_linear_L_scale(self, factor: float) -> None:
         """Adjust the linear shortlist scale multiplicatively (used by controllers)."""
@@ -805,11 +887,150 @@ class AdaptiveSparseAttention(nn.Module):
             return 1.0
         return float((seq_len - low) / (high - low))
 
+    def _compute_cvt_alpha(self, seq_len: int) -> float:
+        seq_len = int(max(1, seq_len))
+        setting = str(self.mode_setting or "").lower()
+        if setting == "linear":
+            base_alpha = 1.0
+        elif setting == "subquad":
+            base_alpha = 0.0
+        else:
+            base_alpha = self._get_shortlist_alpha(seq_len)
+
+        alpha = base_alpha
+        if self.linear_latency_budget_ms is not None and self._latency_ema is not None:
+            budget = self.linear_latency_budget_ms
+            latency = self._latency_ema
+            if latency > budget * 1.05:
+                if self._linear_L_scale_runtime > self._linear_scale_min + 1e-3:
+                    self.adjust_linear_L_scale(self.linear_latency_shrink)
+                alpha = 1.0
+            elif latency < budget * 0.80 and seq_len < max(1, self.linear_switch_ctx):
+                if self._linear_L_scale_runtime < self.linear_L_scale_max:
+                    self.adjust_linear_L_scale(self.linear_latency_growth)
+                alpha = min(alpha, 0.0)
+
+        if self.linear_switch_ctx > 0:
+            hysteresis = max(1, int(self.linear_switch_ctx * 0.75))
+            if self._current_alpha >= 0.95 and seq_len >= hysteresis:
+                alpha = max(alpha, 0.95)
+            if seq_len >= self.linear_switch_ctx:
+                alpha = 1.0
+
+        alpha = float(max(0.0, min(1.0, alpha)))
+        return alpha
+
     def set_shortlist_alpha(self, value: float) -> None:
         """Externally override the shortlist slider (0=dense, 1=linear)."""
         self._shortlist_alpha_override = float(max(0.0, min(1.0, value)))
         self._linear_runtime = None
         self._linear_runtime_seq_len = None
+        self._linear_runtime_alpha = None
+
+    def _update_memory_bank(
+        self,
+        active_head_indices: torch.Tensor,
+        k_comp: torch.Tensor,
+        v_comp: torch.Tensor,
+        active_mask_comp: torch.Tensor,
+    ) -> None:
+        if not self.memory_enabled or self.memory_slots <= 0:
+            return
+        if active_head_indices.numel() == 0:
+            return
+        mask = active_mask_comp
+        if mask.numel() == 0:
+            return
+        counts = mask.sum(dim=1)
+        if not torch.any(counts > 0):
+            return
+        mask_float = mask.to(k_comp.dtype)
+        with torch.no_grad():
+            sums_k = torch.einsum("ht,htd->hd", mask_float, k_comp)
+            sums_v = torch.einsum("ht,htd->hd", mask_float, v_comp)
+            decay = self.memory_decay
+        head_ids = (active_head_indices % self.h_total).to(torch.long)
+        for idx, head in enumerate(head_ids.tolist()):
+            count_val = counts[idx].item()
+            if count_val <= 0:
+                continue
+            if decay < 1.0:
+                self.memory_keys[head] *= decay
+                self.memory_values[head] *= decay
+                self.memory_counts[head] *= decay
+                slot = int(self.memory_ptr[head].item())
+                avg_k = sums_k[idx] / count_val
+                avg_v = sums_v[idx] / count_val
+                self.memory_keys[head, slot] = avg_k.to(self.memory_keys.dtype)
+                self.memory_values[head, slot] = avg_v.to(self.memory_values.dtype)
+                self.memory_counts[head, slot] = float(count_val)
+                self.memory_ptr[head] = (self.memory_ptr[head] + 1) % self.memory_slots
+
+    def _prepare_memory_candidates(
+        self,
+        active_head_indices: torch.Tensor,
+        token_idx_int: torch.Tensor,
+        row_offsets: torch.Tensor,
+        k_comp: torch.Tensor,
+        v_comp: torch.Tensor,
+        *,
+        base_seq_len: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], int]:
+        if not self.memory_enabled or self.memory_slots <= 0:
+            return k_comp, v_comp, None, None, 0
+        if active_head_indices.numel() == 0:
+            return k_comp, v_comp, None, None, 0
+        head_ids = (active_head_indices % self.h_total).to(torch.long)
+        mem_keys = self.memory_keys.index_select(0, head_ids).to(k_comp.dtype)
+        mem_values = self.memory_values.index_select(0, head_ids).to(v_comp.dtype)
+        mem_counts = self.memory_counts.index_select(0, head_ids)
+        valid_mask = mem_counts > 0
+        per_head_counts = valid_mask.sum(dim=1).to(torch.long)
+        max_mem = int(per_head_counts.max().item()) if per_head_counts.numel() > 0 else 0
+        if max_mem <= 0:
+            return k_comp, v_comp, None, None, 0
+        device = k_comp.device
+        active_heads = k_comp.size(0)
+        d_head = k_comp.size(2)
+        mem_k_pad = k_comp.new_zeros(active_heads, max_mem, d_head)
+        mem_v_pad = v_comp.new_zeros(active_heads, max_mem, d_head)
+        mem_valid_pad = torch.zeros(active_heads, max_mem, device=device, dtype=torch.bool)
+        for idx, head in enumerate(head_ids.tolist()):
+            count = int(per_head_counts[idx].item())
+            if count <= 0:
+                continue
+            head_ptr = int(self.memory_ptr[head].item())
+            keys = torch.cat([self.memory_keys[head, head_ptr:], self.memory_keys[head, :head_ptr]], dim=0)
+            values = torch.cat([self.memory_values[head, head_ptr:], self.memory_values[head, :head_ptr]], dim=0)
+            keys = keys.to(k_comp.dtype)
+            values = values.to(v_comp.dtype)
+            mem_k_pad[idx, :count] = keys[:count]
+            mem_v_pad[idx, :count] = values[:count]
+            mem_valid_pad[idx, :count] = True
+        k_aug = torch.cat([k_comp, mem_k_pad], dim=1)
+        v_aug = torch.cat([v_comp, mem_v_pad], dim=1)
+        memory_base = base_seq_len
+        offsets = torch.arange(max_mem, device=device, dtype=torch.long) + memory_base
+        mem_indices = offsets.unsqueeze(0).expand(active_heads, -1)
+        mem_indices = mem_indices.to(token_idx_int.device)
+        total_rows = token_idx_int.numel()
+        row_counts = (row_offsets[1:] - row_offsets[:-1]).to(torch.long)
+        row_head_ids = torch.repeat_interleave(
+            torch.arange(active_heads, device=row_offsets.device, dtype=torch.long),
+            row_counts,
+        )
+        mem_indices_rows = mem_indices[row_head_ids]
+        mem_valid_rows = mem_valid_pad[row_head_ids]
+        fallback = token_idx_int.unsqueeze(1).expand_as(mem_indices_rows)
+        mem_candidates_rows = torch.where(mem_valid_rows, mem_indices_rows.to(token_idx_int.dtype), fallback)
+        mem_lengths_rows = mem_valid_rows.to(torch.long).sum(dim=1)
+        return (
+            k_aug,
+            v_aug,
+            mem_candidates_rows.to(token_idx_int.dtype),
+            mem_lengths_rows.to(token_idx_int.dtype),
+            max_mem,
+        )
 
     def _compute_effective_linear_params(self, seq_len: int, batch_size: Optional[int], alpha: float) -> dict:
         seq_len = max(1, int(seq_len))
@@ -921,10 +1142,15 @@ class AdaptiveSparseAttention(nn.Module):
             "shortlist_alpha": float(alpha),
         }
 
-    def _prepare_linear_runtime(self, seq_len: int, batch_size: Optional[int]) -> dict:
-        if self._linear_runtime is not None and self._linear_runtime_seq_len == seq_len:
+    def _prepare_linear_runtime(self, seq_len: int, batch_size: Optional[int], alpha: float) -> dict:
+        if (
+            self._linear_runtime is not None
+            and self._linear_runtime_seq_len == seq_len
+            and self._linear_runtime_alpha is not None
+            and abs(self._linear_runtime_alpha - float(alpha)) < 1e-4
+        ):
             return self._linear_runtime
-        alpha = self._get_shortlist_alpha(seq_len)
+        alpha = float(max(0.0, min(1.0, alpha)))
         params = self._compute_effective_linear_params(
             seq_len, batch_size, alpha)
         eff = params["effective_L"]
@@ -941,39 +1167,8 @@ class AdaptiveSparseAttention(nn.Module):
         }
         self._linear_runtime = runtime
         self._linear_runtime_seq_len = seq_len
+        self._linear_runtime_alpha = alpha
         return runtime
-
-    def _select_mode(self, seq_len: int) -> str:
-        """
-        Decide whether to run the sub-quadratic sparse path or the constant-L linear path.
-
-        * ``subquad`` keeps the existing token/head sparsity.
-        * ``linear`` runs the shortlist-based constant-L attention.
-        * ``auto`` switches based on configured sequence/latency thresholds.
-        """
-
-        if self.mode_setting == "linear":
-            return "linear"
-        if self.mode_setting == "subquad":
-            return "subquad"
-        if self.linear_latency_budget_ms is not None and self._latency_ema is not None:
-            budget = self.linear_latency_budget_ms
-            latency = self._latency_ema
-            if latency > budget * 1.05:
-                if self._linear_L_scale_runtime > self._linear_scale_min + 1e-3:
-                    self.adjust_linear_L_scale(self.linear_latency_shrink)
-                    self._linear_runtime_seq_len = None
-                return "linear"
-            if latency < budget * 0.80 and seq_len < self.linear_switch_ctx:
-                if self._linear_L_scale_runtime < self.linear_L_scale_max:
-                    self.adjust_linear_L_scale(self.linear_latency_growth)
-                return "subquad"
-        if self.linear_switch_ctx > 0:
-            if seq_len >= self.linear_switch_ctx:
-                return "linear"
-            if self._current_mode == "linear" and seq_len >= max(1, int(self.linear_switch_ctx * 0.75)):
-                return "linear"
-        return "subquad"
 
     def _run_shortlist_attention(
         self,
@@ -986,6 +1181,7 @@ class AdaptiveSparseAttention(nn.Module):
         dropout_p: float,
         head_indices: torch.Tensor,
         causal_mask: torch.Tensor,
+        alpha: float,
     ) -> torch.Tensor:
         """Compute Shortlist attention per head using fused shortlist candidates."""
 
@@ -996,10 +1192,11 @@ class AdaptiveSparseAttention(nn.Module):
             return q_heads.new_zeros(q_heads.shape)
 
         runtime = self._prepare_linear_runtime(
-            seq_len, getattr(self, "_last_batch_size", None))
+            seq_len, getattr(self, "_last_batch_size", None), alpha)
         eff_L = runtime["effective_L"]
 
-        alpha = runtime.get("shortlist_alpha", self._get_shortlist_alpha(seq_len))
+        alpha_runtime = runtime.get(
+            "shortlist_alpha", float(max(0.0, min(1.0, alpha))))
         row_batch_ids: Optional[torch.Tensor]
         proto_scores_all: Optional[torch.Tensor]
         if self.linear_use_proto and self._last_token_similarity is not None:
@@ -1018,10 +1215,59 @@ class AdaptiveSparseAttention(nn.Module):
             row_batch_ids = None
             proto_scores_all = None
 
+        self._update_memory_bank(
+            head_indices,
+            k_heads,
+            v_heads,
+            active_mask,
+        )
+        (
+            k_heads,
+            v_heads,
+            memory_extra,
+            memory_lengths,
+            memory_width,
+        ) = self._prepare_memory_candidates(
+            head_indices,
+            token_idx,
+            row_offsets,
+            k_heads,
+            v_heads,
+            base_seq_len=seq_len,
+        )
+        effective_seq_len = seq_len + memory_width
+
+        if memory_width > 0:
+            pad_shape = (q_heads.size(0), memory_width, q_heads.size(2))
+            q_heads = torch.cat([q_heads, q_heads.new_zeros(pad_shape)], dim=1)
+            active_mask = torch.cat(
+                [
+                    active_mask,
+                    torch.zeros(
+                        active_mask.size(0),
+                        memory_width,
+                        device=active_mask.device,
+                        dtype=active_mask.dtype,
+                    ),
+                ],
+                dim=1,
+            )
+
+        use_quant = bool(self.quantize_sparse_int8 and not self.training)
+        q_input = q_heads
+        k_input = k_heads
+        v_input = v_heads
+        q_scale = k_scale = v_scale = None
+        out_dtype = q_heads.dtype
+        if use_quant:
+            q_input, q_scale = self._quantize_per_head_int8(q_heads, "_quant_ema_q")
+            k_input, k_scale = self._quantize_per_head_int8(k_heads, "_quant_ema_k")
+            v_input, v_scale = self._quantize_per_head_int8(v_heads, "_quant_ema_v")
+
         shortlist_candidates, shortlist_lengths = build_packed_shortlist_candidates(
             token_idx,
             row_batch_ids,
-            seq_len,
+            effective_seq_len,
             max_candidates=eff_L,
             linear_window=runtime["window"],
             anchor_stride=runtime["anchor_stride"],
@@ -1031,13 +1277,15 @@ class AdaptiveSparseAttention(nn.Module):
             local_cap=runtime["local_cap"],
             anchor_cap=runtime["anchor_cap"],
             proto_cap=runtime["proto_cap"],
+            extra_candidates=memory_extra,
+            extra_lengths=memory_lengths,
         )
 
         self._last_shortlist_backend_info = None
         attn_sparse = dmoah_sparse_attention(
-            q_heads,
-            k_heads,
-            v_heads,
+            q_input,
+            k_input,
+            v_input,
             active_mask=active_mask.unsqueeze(-1).contiguous(),
             causal_mask=causal_mask,
             dropout_p=dropout_p,
@@ -1045,12 +1293,18 @@ class AdaptiveSparseAttention(nn.Module):
             prepacked=packed,
             shortlist_candidates=shortlist_candidates,
             shortlist_lengths=shortlist_lengths,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            out_dtype=out_dtype if use_quant else None,
         )
         self._last_shortlist_backend_info = get_last_backend_info()
         if self._last_sparse_state is not None:
-            self._last_sparse_state["shortlist_alpha"] = float(alpha)
+            self._last_sparse_state["shortlist_alpha"] = float(alpha_runtime)
         if self.last_head_stats is not None:
-            self.last_head_stats["shortlist_alpha"] = float(alpha)
+            self.last_head_stats["shortlist_alpha"] = float(alpha_runtime)
+        if memory_width > 0:
+            attn_sparse = attn_sparse[:, :seq_len, :]
         return attn_sparse
 
     def _quantize_per_head_int8(self, tensor: torch.Tensor, ema_buffer: str) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1176,6 +1430,9 @@ class AdaptiveSparseAttention(nn.Module):
             "force_dense_threshold": None if self._dense_threshold is None else float(self._dense_threshold),
             "active_curve": float(self.h_active_curve),
             "token_keep_fraction": float(1.0),
+            "router_top_p": float(self.router_top_p),
+            "nucleus_k": int(self.h_total),
+            "top_a_consensus": True,
         }
         self.last_router_reg = None
         return y
@@ -1244,10 +1501,14 @@ class AdaptiveSparseAttention(nn.Module):
             _finalize_latency("dense_fastpath")
             return y
 
-        mode_now = self._select_mode(T)
-        self._current_mode = mode_now
-        if mode_now == "linear":
-            self._token_keep_ratio_runtime = self._linear_token_keep_ratio(T)
+        alpha = self._compute_cvt_alpha(T)
+        self._current_alpha = alpha
+        if self.token_sparse:
+            dense_ratio = float(self.token_keep_ratio_base)
+            linear_ratio = float(self._linear_token_keep_ratio(T))
+            blend_ratio = (1.0 - alpha) * dense_ratio + alpha * linear_ratio
+            blend_ratio = float(max(0.0, min(1.0, blend_ratio)))
+            self._token_keep_ratio_runtime = blend_ratio
         else:
             self._token_keep_ratio_runtime = None
 
@@ -1308,11 +1569,19 @@ class AdaptiveSparseAttention(nn.Module):
                 reg_terms.append(l1_term)
             lb_requested = _mode_has("load_balance")
 
-        # Select the Top-K active heads for each token (adaptive top-k)
-        topk = self._choose_active_k(T)
-        if mode_now == "linear":
-            topk = max(1, min(topk, self.linear_head_k))
-            self._last_target_k = topk
+        # Select the active heads via nucleus mass (adaptive top-p) blended with CVT schedule.
+        dense_topk = self._choose_active_k(T)
+        adaptive_topk = dense_topk
+        if self.router_top_p > 0.0:
+            nucleus_k = self._nucleus_head_count(
+                head_probs, self.router_top_p, dense_topk
+            )
+            adaptive_topk = max(self.h_active_min, min(dense_topk, nucleus_k))
+        linear_topk = max(1, min(adaptive_topk, self.linear_head_k))
+        blended_topk = (1.0 - alpha) * float(adaptive_topk) + alpha * float(linear_topk)
+        topk = max(1, int(round(blended_topk)))
+        topk = min(adaptive_topk, topk)
+        self._last_target_k = topk
         if topk <= 0:
             raise RuntimeError(
                 "DMoAH requires at least one active head per token")
@@ -1350,12 +1619,21 @@ class AdaptiveSparseAttention(nn.Module):
         density_threshold = self._density_threshold()
         all_rows_active = bool(active_mask_flat.all(
         ).item()) if active_mask_flat.numel() else False
+        prefer_dense = alpha <= self.dense_alpha_cutoff and not self.quantize_sparse_int8
         force_dense = False
+        dense_reason: Optional[str] = None
+        if prefer_dense:
+            force_dense = True
+            dense_reason = "alpha"
         if density_threshold is not None and density_est >= density_threshold:
             force_dense = True
+            dense_reason = dense_reason or "density"
         elif all_rows_active and self.force_dense_when_full:
             force_dense = True
-        if mode_now == "linear":
+            dense_reason = dense_reason or "full"
+        if alpha >= 0.95:
+            if dense_reason == "alpha":
+                dense_reason = None
             force_dense = False
 
         qkv = self.qkv(x)
@@ -1376,7 +1654,6 @@ class AdaptiveSparseAttention(nn.Module):
             B * self.h_total, T, self.d_head)
 
         limit = TRITON_SEQ_LEN_LIMIT
-        long_context = limit > 0 and T >= limit
         causal_mask: Optional[torch.Tensor] = None
         dropout_p = self.dropout.p if self.training else 0.0
 
@@ -1399,7 +1676,12 @@ class AdaptiveSparseAttention(nn.Module):
 
             attn_out = attn_flat.view(
                 B, self.h_total, T, self.d_head).permute(0, 2, 1, 3)
-            mode_str = "dense" if total_active_heads == B * self.h_total else "dense_auto"
+            if dense_reason == "alpha":
+                mode_str = "dense_alpha"
+            elif total_active_heads == B * self.h_total:
+                mode_str = "dense"
+            else:
+                mode_str = "dense_auto"
             exec_mode_label = mode_str
             self._last_sparse_state = {
                 "mode": mode_str,
@@ -1411,9 +1693,12 @@ class AdaptiveSparseAttention(nn.Module):
                 "quantized": False,
                 "token_keep_fraction": float(token_keep_fraction),
                 "mode_setting": self.mode_setting,
-                "mode_selected": mode_now,
+                "mode_selected": f"cvt(alpha={alpha:.2f})",
+                "shortlist_alpha": float(alpha),
+                "dense_reason": dense_reason,
             }
         else:
+            dense_reason = None
             active_head_indices = active_head_mask.nonzero(
                 as_tuple=False).squeeze(1)
             if active_head_indices.numel() == 0:
@@ -1430,7 +1715,9 @@ class AdaptiveSparseAttention(nn.Module):
                     "quantized": False,
                     "token_keep_fraction": float(token_keep_fraction),
                     "mode_setting": self.mode_setting,
-                    "mode_selected": mode_now,
+                    "mode_selected": f"cvt(alpha={alpha:.2f})",
+                    "shortlist_alpha": float(alpha),
+                    "dense_reason": dense_reason,
                 }
             else:
                 active_mask_comp = active_mask_flat.index_select(
@@ -1486,72 +1773,29 @@ class AdaptiveSparseAttention(nn.Module):
                         "quantized": False,
                         "token_keep_fraction": float(token_keep_fraction),
                         "mode_setting": self.mode_setting,
-                        "mode_selected": mode_now,
+                        "mode_selected": f"cvt(alpha={alpha:.2f})",
+                        "shortlist_alpha": float(alpha),
                     }
                     exec_mode_label = "sparse"
                 else:
                     head_idx, token_idx, row_offsets, max_rows = packed
-                    backend_name: str
-                    mode_label = "sparse"
+                    attn_sparse = self._run_shortlist_attention(
+                        q_comp,
+                        k_comp,
+                        v_comp,
+                        active_mask_comp,
+                        packed,
+                        T,
+                        dropout_p,
+                        active_head_indices,
+                        causal_mask,
+                        alpha,
+                    )
+                    backend_info = self._last_shortlist_backend_info or get_last_backend_info()
+                    backend_name = str(backend_info.get("name", "shortlist"))
+                    mode_label = "shortlist"
+                    exec_mode_label = "shortlist"
                     use_quant = False
-                    if mode_now == "linear":
-                        attn_sparse = self._run_shortlist_attention(
-                            q_comp,
-                            k_comp,
-                            v_comp,
-                            active_mask_comp,
-                            packed,
-                            T,
-                            dropout_p,
-                            active_head_indices,
-                            causal_mask,
-                        )
-                        backend_info = self._last_shortlist_backend_info or get_last_backend_info()
-                        backend_name = str(backend_info.get("name", "shortlist"))
-                        mode_label = "shortlist"
-                        exec_mode_label = "shortlist"
-                    else:
-                        use_quant = bool(
-                            self.quantize_sparse_int8 and not self.training and not long_context
-                        )
-                        if not long_context and causal_mask is None:
-                            causal_mask = self._causal_mask(
-                                T, device, q_flat.dtype)
-                        if use_quant:
-                            q_quant, q_scales = self._quantize_per_head_int8(
-                                q_comp, "_quant_ema_q")
-                            k_quant, k_scales = self._quantize_per_head_int8(
-                                k_comp, "_quant_ema_k")
-                            v_quant, v_scales = self._quantize_per_head_int8(
-                                v_comp, "_quant_ema_v")
-                            attn_sparse = dmoah_sparse_attention(
-                                q_quant,
-                                k_quant,
-                                v_quant,
-                                active_mask=active_mask_comp.unsqueeze(
-                                    -1).contiguous(),
-                                causal_mask=causal_mask,
-                                dropout_p=dropout_p,
-                                training=self.training,
-                                prepacked=packed,
-                                q_scale=q_scales,
-                                k_scale=k_scales,
-                                v_scale=v_scales,
-                                out_dtype=q_comp.dtype,
-                            )
-                        else:
-                            attn_sparse = dmoah_sparse_attention(
-                                q_comp,
-                                k_comp,
-                                v_comp,
-                                active_mask=active_mask_comp.unsqueeze(
-                                    -1).contiguous(),
-                                causal_mask=causal_mask,
-                                dropout_p=dropout_p,
-                                training=self.training,
-                                prepacked=packed,
-                            )
-                        backend_name = get_last_backend()
 
                     attn_out_flat = q_flat.new_zeros(
                         B * self.h_total, T, self.d_head)
@@ -1574,31 +1818,34 @@ class AdaptiveSparseAttention(nn.Module):
                         "quantized": bool(use_quant),
                         "token_keep_fraction": float(token_keep_fraction),
                         "mode_setting": self.mode_setting,
-                        "mode_selected": mode_now,
+                        "mode_selected": f"cvt(alpha={alpha:.2f})",
+                        "shortlist_alpha": float(alpha),
                     }
-                    if mode_now == "linear":
-                        sparse_state["linear_L"] = int(self.linear_L)
-                        sparse_state["linear_window"] = int(self.linear_window)
-                        sparse_state["linear_anchor_stride"] = int(
-                            self.linear_anchor_stride)
-                        backend_info = self._last_shortlist_backend_info or get_last_backend_info()
-                        backend_name = backend_info.get("name") if isinstance(
-                            backend_info, dict) else None
+                    sparse_state["linear_L"] = int(self.linear_L)
+                    sparse_state["linear_window"] = int(self.linear_window)
+                    sparse_state["linear_anchor_stride"] = int(
+                        self.linear_anchor_stride)
+                    if isinstance(backend_info, dict):
+                        backend_name = backend_info.get("name")
                         if backend_name is not None:
                             sparse_state["linear_shortlist_backend"] = backend_name
-                            details = backend_info.get("details") if isinstance(
-                                backend_info, dict) else None
-                            if isinstance(details, dict):
-                                for key, value in details.items():
-                                    sparse_state[f"linear_shortlist_{key}"] = value
+                        details = backend_info.get("details")
+                        if isinstance(details, dict):
+                            for key, value in details.items():
+                                sparse_state[f"linear_shortlist_{key}"] = value
                     self._last_sparse_state = sparse_state
-                    if mode_now != "linear":
-                        exec_mode_label = mode_label
 
         # Merge head dimension back to (B, T, C)
         if token_mask is not None:
             attn_out = attn_out * token_mask.unsqueeze(-1).unsqueeze(-1)
-        y = attn_out.reshape(B, T, C)
+        # Store the raw attention consensus before projection so Top-A sampling can compare candidates
+        # against the active-head “intent” rather than the fully mixed LM output.
+        head_consensus = attn_out.reshape(B, T, C)
+        if self.training:
+            self.last_head_consensus = None
+        else:
+            self.last_head_consensus = head_consensus.detach()
+        y = head_consensus
 
         # --- 4. Final Projection ---
         # The output `y` is now a sparse combination of head outputs. We project it back.
@@ -1635,8 +1882,15 @@ class AdaptiveSparseAttention(nn.Module):
             "active_curve": float(self.h_active_curve),
             "token_keep_fraction": float(token_keep_fraction),
             "mode": exec_mode_label,
+            "mode_selected": f"cvt(alpha={alpha:.2f})",
+            "shortlist_alpha": float(alpha),
+            "router_top_p": float(self.router_top_p),
+            "nucleus_k": int(adaptive_topk),
+            "top_a_consensus": True,
         }
-        if mode_now == "linear":
+        if dense_reason is not None:
+            self.last_head_stats["dense_reason"] = dense_reason
+        if alpha > 0.0:
             self.last_head_stats["linear_L"] = int(self.linear_L)
             self.last_head_stats["linear_window"] = int(self.linear_window)
             self.last_head_stats["linear_anchor_stride"] = int(
@@ -1660,7 +1914,7 @@ class AdaptiveSparseAttention(nn.Module):
         self.last_router_reg = router_reg
         self._update_routing_prototypes(x, gate_probs)
 
-        _finalize_latency(exec_mode_label)
+        _finalize_latency(f"cvt(alpha={alpha:.2f})::{exec_mode_label}")
         if self.linear_mem_budget_mb and device.type == "cuda":
             try:
                 allocated = torch.cuda.memory_allocated(device) / (1024 * 1024)

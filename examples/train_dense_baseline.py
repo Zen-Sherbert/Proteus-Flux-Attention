@@ -34,13 +34,13 @@ def run_training(
     batch_size: int,
     lr: float,
     device: torch.device,
-    prompt: str,
     sample_tokens: int,
     data_path: Optional[Path] = None,
 ) -> dict:
     tokenizer = common.get_tokenizer()
-    text = common.load_corpus(data_path)
+    text = common.load_corpus(data_path, max_chars=4 * 1024 * 1024)
     tokens = tokenizer.encode(text)
+    train_tokens, val_tokens = common.split_train_val(tokens, seq_len, val_fraction=0.1)
 
     vocab_size = getattr(tokenizer, "n_vocab", 256)
     train_cfg = common.TrainingConfig(
@@ -64,8 +64,7 @@ def run_training(
     )
     model = MiniDenseLM(model_cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
-
-    batches = common.build_batches(tokens, seq_len, batch_size, device=device)
+    batches = common.build_batches(train_tokens, seq_len, batch_size, device=device)
     losses: list[float] = []
     model.train()
     for step in range(1, steps + 1):
@@ -82,11 +81,22 @@ def run_training(
             print(f"[dense-baseline] step={step}/{steps} loss={loss.item():.4f} ppl={ppl:.2f}")
 
     model.eval()
-    with torch.inference_mode():
-        encoded_prompt = tokenizer.encode(prompt)
-        input_ids = torch.tensor(encoded_prompt, dtype=torch.long, device=device).unsqueeze(0)
-        out_tokens = model.generate(input_ids, max_new_tokens=sample_tokens)
-        completion = tokenizer.decode(out_tokens[0].tolist())
+    val_loss, val_ppl = common.evaluate_language_model(
+        model,
+        val_tokens,
+        seq_len=seq_len,
+        batch_size=batch_size,
+        device=device,
+    )
+    final_loss = losses[-1]
+    train_ppl = float(torch.exp(torch.tensor(final_loss)).item())
+    metrics = {
+        "steps": steps,
+        "train_loss": final_loss,
+        "train_ppl": train_ppl,
+        "val_loss": val_loss,
+        "val_ppl": val_ppl,
+    }
 
     ckpt_dir = common.ensure_checkpoint_dir("dense_baseline")
     ckpt_path = ckpt_dir / "model.pt"
@@ -100,25 +110,34 @@ def run_training(
     )
     meta = {
         "steps": steps,
-        "final_loss": losses[-1],
+        "final_loss": final_loss,
+        "final_ppl": train_ppl,
+        "val_loss": val_loss,
+        "val_ppl": val_ppl,
         "checkpoint": str(ckpt_path),
     }
     (ckpt_dir / "training.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    (ckpt_dir / "sample.txt").write_text(completion, encoding="utf-8")
     print(f"[dense-baseline] saved checkpoint to {ckpt_path}")
-    print(f"[dense-baseline] sample:\n{completion}")
+    common.print_metric_block("dense-baseline", metrics)
+    common.interactive_inference_loop(
+        model,
+        tokenizer,
+        device=device,
+        max_seq_len=model_cfg.max_seq_len,
+        sample_tokens=sample_tokens,
+        label="dense-baseline",
+    )
     return meta
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Dense Transformer baseline trainer.")
-    parser.add_argument("--steps", type=int, default=500, help="Number of optimization steps.")
+    parser.add_argument("--steps", type=int, default=2500, help="Number of optimization steps.")
     parser.add_argument("--seq-len", type=int, default=256, help="Training sequence length.")
     parser.add_argument("--batch-size", type=int, default=8, help="Mini-batch size.")
     parser.add_argument("--lr", type=float, default=3e-4, help="AdamW learning rate.")
     parser.add_argument("--device", default=None, help="Device string (default auto).")
-    parser.add_argument("--prompt", default="Once upon a time", help="Prompt for generation.")
-    parser.add_argument("--sample-tokens", type=int, default=80, help="Tokens to generate.")
+    parser.add_argument("--sample-tokens", type=int, default=80, help="Tokens to generate per query in inference mode.")
     parser.add_argument("--data", type=Path, default=None, help="Optional path to training text.")
     return parser.parse_args()
 
@@ -128,15 +147,15 @@ def main() -> None:
     device = torch.device(args.device) if args.device else torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
+    data_path = common.resolve_dataset_path(args.data, label="dense-baseline")
     run_training(
         steps=args.steps,
         seq_len=args.seq_len,
         batch_size=args.batch_size,
         lr=args.lr,
         device=device,
-        prompt=args.prompt,
         sample_tokens=args.sample_tokens,
-        data_path=args.data,
+        data_path=data_path,
     )
 
 

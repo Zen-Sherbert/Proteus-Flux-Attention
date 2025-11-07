@@ -116,6 +116,34 @@ else:
         _CACHE_DIR = Path.cwd() / ".proteus_attention_cache"
 _CACHE_FILE = _CACHE_DIR / "shortlist_block_config.json"
 _BLOCK_CONFIG_CACHE: Dict[str, Tuple[int, int, int]] = {}
+_ARANGE_CACHE: Dict[Tuple[str, int, torch.dtype, int, int, int], torch.Tensor] = {}
+
+
+def _cached_arange(
+    length: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    start: int = 0,
+    step: int = 1,
+) -> torch.Tensor:
+    length = int(length)
+    if length <= 0:
+        return torch.empty((0,), device=device, dtype=dtype)
+    key = (
+        device.type,
+        int(device.index) if device.index is not None else -1,
+        dtype,
+        length,
+        start,
+        step,
+    )
+    tensor = _ARANGE_CACHE.get(key)
+    if tensor is None or tensor.device != device:
+        stop = start + step * length
+        tensor = torch.arange(start, stop, step, device=device, dtype=dtype)
+        _ARANGE_CACHE[key] = tensor
+    return tensor
 
 
 def _load_block_cache() -> None:
@@ -258,7 +286,7 @@ def _shortlist_prepare_proto_candidates(
         return None
 
     counts = torch.clamp(rows + 1, max=cap)
-    indices = torch.arange(max_index, device=device)
+    indices = _cached_arange(max_index, device=device, dtype=rows.dtype)
     mask = indices.unsqueeze(0) <= rows.unsqueeze(1)
     scores = proto.unsqueeze(0).expand(rows.size(0), -1)
     scores = scores.masked_fill(~mask, float('-inf'))
@@ -266,7 +294,7 @@ def _shortlist_prepare_proto_candidates(
 
     base = rows.unsqueeze(1).expand(-1, cap).to(rows.dtype)
     proto_candidates = base.clone()
-    valid = torch.arange(cap, device=device).unsqueeze(0) < counts.unsqueeze(1)
+    valid = _cached_arange(cap, device=device, dtype=rows.dtype).unsqueeze(0) < counts.unsqueeze(1)
     proto_candidates = torch.where(valid, top_idx.to(rows.dtype), proto_candidates)
     return proto_candidates
 
@@ -374,7 +402,7 @@ def build_shortlist_candidates(
     if use_local and local_cap_val > 0:
         window = min(linear_window, max_candidates, local_cap_val)
         if window > 0:
-            steps = torch.arange(window, device=device, dtype=dtype)
+            steps = _cached_arange(window, device=device, dtype=dtype)
             lengths = torch.clamp(rows + 1, max=window)
             start = rows - lengths + 1
             start = torch.clamp(start, min=0)
@@ -386,7 +414,7 @@ def build_shortlist_candidates(
     if use_anchors and anchor_stride > 0 and anchor_cap_val > 0:
         slots = min(anchor_cap_val, max_candidates, max(1, seq_len))
         if slots > 0:
-            steps = torch.arange(1, slots + 1, device=device, dtype=dtype)
+            steps = _cached_arange(slots, device=device, dtype=dtype, start=1)
             anchors = rows.unsqueeze(1) - steps.unsqueeze(0) * anchor_stride
             anchors = torch.clamp(anchors, min=0)
             pieces.append(anchors)
@@ -441,6 +469,8 @@ def build_packed_shortlist_candidates(
     anchor_cap: Optional[int] = None,
     proto_cap: Optional[int] = None,
     chunk_size: int = 4096,
+    extra_candidates: Optional[torch.Tensor] = None,
+    extra_lengths: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Assemble Shortlist shortlist candidates for a packed set of rows spanning multiple heads/batches.
@@ -488,7 +518,7 @@ def build_packed_shortlist_candidates(
         if use_local and local_cap_val > 0:
             window = min(linear_window, max_candidates, local_cap_val)
             if window > 0:
-                steps = torch.arange(window, device=device, dtype=dtype)
+                steps = _cached_arange(window, device=device, dtype=dtype)
                 lengths = torch.clamp(chunk_rows + 1, max=window)
                 start_idx = torch.clamp(chunk_rows - lengths + 1, min=0)
                 local = start_idx.unsqueeze(1) + steps.unsqueeze(0)
@@ -499,7 +529,7 @@ def build_packed_shortlist_candidates(
         if use_anchors and anchor_stride > 0 and anchor_cap_val > 0:
             slots = min(anchor_cap_val, max_candidates, max(1, seq_len))
             if slots > 0:
-                steps = torch.arange(1, slots + 1, device=device, dtype=dtype)
+                steps = _cached_arange(slots, device=device, dtype=dtype, start=1)
                 anchors = chunk_rows.unsqueeze(1) - steps.unsqueeze(0) * anchor_stride
                 anchors = torch.clamp(anchors, min=0)
                 chunk_pieces.append(anchors)
@@ -518,6 +548,19 @@ def build_packed_shortlist_candidates(
             )
             if proto_chunk is not None and proto_chunk.numel() > 0:
                 chunk_pieces.append(proto_chunk.to(dtype))
+
+        if extra_candidates is not None:
+            chunk_extra = extra_candidates[start:end]
+            if chunk_extra.numel() > 0:
+                chunk_extra = chunk_extra.to(device=device, dtype=dtype)
+                if extra_lengths is not None:
+                    chunk_extra_len = extra_lengths[start:end].to(device=device, dtype=torch.long)
+                    width = chunk_extra.size(1)
+                    steps = _cached_arange(width, device=device, dtype=torch.long)
+                    valid = steps.unsqueeze(0) < chunk_extra_len.unsqueeze(1)
+                    fallback = chunk_rows.unsqueeze(1).expand_as(chunk_extra)
+                    chunk_extra = torch.where(valid, chunk_extra, fallback)
+                chunk_pieces.append(chunk_extra)
 
         if chunk_pieces:
             candidates = torch.cat(chunk_pieces, dim=1)
@@ -946,7 +989,7 @@ def _fallback_sparse_attention(
             k_sel = k_head[cand_rows.clamp(min=0, max=tokens - 1)]
             v_sel = v_head[cand_rows.clamp(min=0, max=tokens - 1)]
 
-            mask_invalid = torch.arange(max_len, device=q.device).unsqueeze(0) >= len_rows.unsqueeze(1)
+            mask_invalid = _cached_arange(max_len, device=q.device, dtype=len_rows.dtype).unsqueeze(0) >= len_rows.unsqueeze(1)
             k_sel = k_sel.masked_fill(mask_invalid.unsqueeze(-1), 0.0)
             v_sel = v_sel.masked_fill(mask_invalid.unsqueeze(-1), 0.0)
 
@@ -977,7 +1020,7 @@ def _fallback_sparse_attention(
                 mask_slice = mask_slice[:, : max_token + 1]
                 attn_mask = mask_slice.unsqueeze(0)
             else:
-                key_positions = torch.arange(
+                key_positions = _cached_arange(
                     max_token + 1, device=rows_tokens.device, dtype=rows_tokens.dtype
                 )
                 future_mask = key_positions.unsqueeze(0) > rows_tokens.unsqueeze(1)
@@ -1223,6 +1266,7 @@ def _launch_triton_sparse_attention(
     head_dim = q_contig.size(2)
 
     out = torch.zeros_like(q_contig)
+    scratch = torch.empty_like(out)
 
     has_qscale = q_scale is not None
     has_kscale = k_scale is not None
@@ -1304,12 +1348,13 @@ def _launch_triton_sparse_attention(
     if device.type == "cuda":
 
         def _benchmark(block_cfg: Tuple[int, int, int]) -> Optional[float]:
-            tmp_out = torch.empty_like(out)
             torch.cuda.synchronize(device)
-            _run_shortlist_attention_kernel(block_cfg, out=tmp_out, **kernel_args)
+            scratch.zero_()
+            _run_shortlist_attention_kernel(block_cfg, out=scratch, **kernel_args)
             torch.cuda.synchronize(device)
             start = time.perf_counter()
-            _run_shortlist_attention_kernel(block_cfg, out=tmp_out, **kernel_args)
+            scratch.zero_()
+            _run_shortlist_attention_kernel(block_cfg, out=scratch, **kernel_args)
             torch.cuda.synchronize(device)
             return time.perf_counter() - start
 
@@ -1426,9 +1471,15 @@ def dmoah_sparse_attention(
         packed = _pack_active_rows(mask_bool_bool)
     if packed is None:
         if mask_bool_bool.all():
-            head_idx = torch.arange(batch_heads, device=q.device, dtype=torch.long).repeat_interleave(tokens)
-            token_idx = torch.arange(tokens, device=q.device, dtype=torch.long).repeat(batch_heads)
-            row_offsets = torch.arange(0, (batch_heads + 1) * tokens, tokens, device=q.device, dtype=torch.int32)
+            head_idx = _cached_arange(batch_heads, device=q.device, dtype=torch.long).repeat_interleave(tokens)
+            token_idx = _cached_arange(tokens, device=q.device, dtype=torch.long).repeat(batch_heads)
+            row_offsets = _cached_arange(
+                batch_heads + 1,
+                device=q.device,
+                dtype=torch.int32,
+                start=0,
+                step=tokens,
+            )
             max_rows = tokens
             packed = (head_idx, token_idx, row_offsets, max_rows)
         else:

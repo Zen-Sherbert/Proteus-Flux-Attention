@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
@@ -44,12 +45,12 @@ def run_training(
     lr: float,
     device: torch.device,
     data_path: Optional[Path] = None,
-    prompt: str,
     sample_tokens: int,
 ) -> dict:
     tokenizer = common.get_tokenizer()
-    text = common.load_corpus(data_path)
+    text = common.load_corpus(data_path, max_chars=4 * 1024 * 1024)
     tokens = tokenizer.encode(text)
+    train_tokens, val_tokens = common.split_train_val(tokens, short_seq, val_fraction=0.1)
 
     vocab_size = getattr(tokenizer, "n_vocab", 256)
     train_cfg = common.TrainingConfig(
@@ -70,6 +71,10 @@ def run_training(
         dim_feedforward=train_cfg.dim_feedforward,
         dropout=train_cfg.dropout,
         max_seq_len=train_cfg.max_seq_len,
+        attn_proto_enable=True,
+        attn_memory_enable=True,
+        attn_memory_slots=64,
+        attn_memory_decay=0.95,
     )
     model = MiniProteusLM(model_cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
@@ -81,6 +86,7 @@ def run_training(
     ]
 
     logs = []
+    attn_counters = common.init_attn_counters()
     remaining = total_steps
     base_tokens = short_seq * batch_size
 
@@ -94,7 +100,7 @@ def run_training(
         stage_batch = max(1, int(base_tokens // seq_len))
         if stage_batch < 1:
             stage_batch = 1
-        batches = common.build_batches(tokens, seq_len, stage_batch, device=device)
+        batches = common.build_batches(train_tokens, seq_len, stage_batch, device=device)
         _set_alpha(model, alpha)
 
         stage_losses: list[float] = []
@@ -108,6 +114,7 @@ def run_training(
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             stage_losses.append(float(loss.item()))
+            common.accumulate_attention_counters(model, attn_counters)
             if step % max(1, steps // 5) == 0 or step == 1:
                 ppl = float(torch.exp(loss.detach()).item())
                 print(
@@ -128,12 +135,24 @@ def run_training(
             }
         )
 
-    model.eval()
-    with torch.inference_mode():
-        encoded_prompt = tokenizer.encode(prompt)
-        input_ids = torch.tensor(encoded_prompt, dtype=torch.long, device=device).unsqueeze(0)
-        out_tokens = model.generate(input_ids, max_new_tokens=sample_tokens)
-        completion = tokenizer.decode(out_tokens[0].tolist())
+    val_loss, val_ppl = common.evaluate_language_model(
+        model,
+        val_tokens,
+        seq_len=long_seq,
+        batch_size=batch_size,
+        device=device,
+    )
+    final_stage = logs[-1] if logs else {}
+    final_loss = final_stage.get("loss_final", float("nan"))
+    final_ppl = float(torch.exp(torch.tensor(final_loss)).item()) if not math.isnan(final_loss) else float("nan")
+    summary = {
+        "steps": total_steps,
+        "train_loss": final_loss,
+        "train_ppl": final_ppl,
+        "val_loss": val_loss,
+        "val_ppl": val_ppl,
+    }
+    attn_summary = common.summarize_attention_counters(attn_counters, total_steps)
 
     ckpt_dir = common.ensure_checkpoint_dir("context_slide")
     ckpt_path = ckpt_dir / "model.pt"
@@ -147,16 +166,23 @@ def run_training(
         ckpt_path,
     )
     (ckpt_dir / "stages.json").write_text(json.dumps(logs, indent=2), encoding="utf-8")
-    sample_path = ckpt_dir / "sample.txt"
-    sample_path.write_text(completion, encoding="utf-8")
     print(f"[context-slide] saved checkpoint to {ckpt_path}")
-    print(f"[context-slide] sample:\n{completion}")
-    return {"checkpoint": str(ckpt_path), "stages": logs, "sample": str(sample_path)}
+    common.print_metric_block("context-slide", summary)
+    common.print_metric_block("context-slide.attention", attn_summary)
+    common.interactive_inference_loop(
+        model,
+        tokenizer,
+        device=device,
+        max_seq_len=model_cfg.max_seq_len,
+        sample_tokens=sample_tokens,
+        label="context-slide",
+    )
+    return {"checkpoint": str(ckpt_path), "stages": logs, "metrics": summary}
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Proteus Attention context-slide trainer.")
-    parser.add_argument("--steps", type=int, default=900, help="Total optimization steps.")
+    parser.add_argument("--steps", type=int, default=2500, help="Total optimization steps.")
     parser.add_argument("--short-seq", type=int, default=256, help="Short curriculum length.")
     parser.add_argument("--medium-seq", type=int, default=1024, help="Medium curriculum length.")
     parser.add_argument("--long-seq", type=int, default=4096, help="Long curriculum length.")
@@ -164,7 +190,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate.")
     parser.add_argument("--device", default=None, help="Device string (default auto).")
     parser.add_argument("--data", type=Path, default=None, help="Optional training text.")
-    parser.add_argument("--prompt", default="The system recalls", help="Prompt for generation.")
     parser.add_argument("--sample-tokens", type=int, default=120, help="Tokens to sample.")
     return parser.parse_args()
 
@@ -174,6 +199,7 @@ def main() -> None:
     device = torch.device(args.device) if args.device else torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
+    data_path = common.resolve_dataset_path(args.data, label="context-slide")
     run_training(
         total_steps=args.steps,
         short_seq=args.short_seq,
@@ -182,8 +208,7 @@ def main() -> None:
         batch_size=args.batch_size,
         lr=args.lr,
         device=device,
-        data_path=args.data,
-        prompt=args.prompt,
+        data_path=data_path,
         sample_tokens=args.sample_tokens,
     )
 

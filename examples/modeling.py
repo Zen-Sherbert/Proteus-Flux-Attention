@@ -72,6 +72,11 @@ class ModelConfig:
     dim_feedforward: int
     dropout: float
     max_seq_len: int
+    attn_proto_enable: bool = True
+    attn_memory_enable: bool = True
+    attn_memory_slots: int = 32
+    attn_memory_decay: float = 0.9
+    attn_router_top_p: float = 0.9
 
 
 class MiniProteusLM(nn.Module):
@@ -85,15 +90,21 @@ class MiniProteusLM(nn.Module):
         self.dropout = nn.Dropout(cfg.dropout)
         blocks = []
         for _ in range(cfg.num_layers):
+            attn_kwargs = {
+                "max_seq_len": cfg.max_seq_len,
+                "return_stats_default": False,
+                "attn_proto_enable": cfg.attn_proto_enable,
+                "attn_memory_enable": cfg.attn_memory_enable,
+                "attn_memory_slots": cfg.attn_memory_slots,
+                "attn_memory_decay": cfg.attn_memory_decay,
+                "attn_router_top_p": cfg.attn_router_top_p,
+            }
             block = CausalGeneticTransformerBlock(
                 embed_dim=cfg.embed_dim,
                 num_heads=cfg.num_heads,
                 dim_feedforward=cfg.dim_feedforward,
                 dropout=cfg.dropout,
-                attention_kwargs={
-                    "max_seq_len": cfg.max_seq_len,
-                    "return_stats_default": False,
-                },
+                attention_kwargs=attn_kwargs,
             )
             blocks.append(block)
         self.blocks = nn.ModuleList(blocks)
@@ -119,6 +130,17 @@ class MiniProteusLM(nn.Module):
         if return_attn:
             return logits, attn_outputs
         return logits
+
+    def last_head_consensus(self) -> Optional[torch.Tensor]:
+        """Return the most recent head-level consensus from the top block, if available."""
+        for block in reversed(self.blocks):
+            attn = getattr(block, "attn", None)
+            if attn is None:
+                continue
+            consensus = getattr(attn, "last_head_consensus", None)
+            if consensus is not None:
+                return consensus
+        return None
 
     @torch.inference_mode()
     def generate(
