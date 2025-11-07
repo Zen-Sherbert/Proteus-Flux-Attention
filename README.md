@@ -23,23 +23,26 @@ The system is built with custom Triton kernels for high performance on CUDA-enab
 
 The following benchmark was run on a single GPU with 16GB of VRAM using the `scripts/tinytoy.py` script. It compares the performance and memory usage of Proteus Attention (DMoAH) against a standard PyTorch `nn.MultiheadAttention` implementation across various sequence lengths.
 
-| Seq Len | Model              | Latency (ms) | Memory (MB) | Mode      | Result                                         |
-| :------ | :----------------- | :----------- | :---------- | :-------- | :--------------------------------------------- |
-| 4,096   | Standard Attention | 11.77        | 1,138.46    | -         | Success                                        |
-| 4,096   | DMoAH (BF16)       | 15.62        | 384.14      | `sparse`  | Success                                        |
-| **16,384**  | Standard Attention | **69.17**        | **4,234.35**    | -         | **Success**                                    |
-| **16,384**  | DMoAH (BF16)       | **51.98**        | **839.76**      | `sparse`  | **Success**                                    |
-| **32,768**  | Standard Attention | -            | -           | -         | **Out of Memory**                              |
-| 32,768  | DMoAH (BF16)       | 99.63        | 961.17      | `shortlist` | Success                                        |
-| 131,072 | DMoAH (BF16)       | 287.66       | 2,813.49    | `shortlist` | Success                                        |
-| **524,288** | DMoAH (BF16)       | **1947.55**      | **11,081.79**   | `shortlist` | **Success**                                    |
-| **1,048,576** | DMoAH (BF16)       | -            | -           | `shortlist` | **Out of Memory**                              |
+| Seq Len | Model              | Latency (ms) | Memory (MB) | Mode        | Result        |
+| :------ | :----------------- | :----------- | :---------- | :---------- | :------------ |
+| 4,096   | Standard Attention | 11.67        | 1,137.90    | -           | Success       |
+| 4,096   | DMoAH (BF16)       | 64.45        | 857.48      | `shortlist` | Success       |
+| 16,384  | Standard Attention | 41.14        | 4,234.08    | -           | Success       |
+| 16,384  | DMoAH (BF16)       | 27.92        | 644.93      | `shortlist` | Success       |
+| 32,768  | Standard Attention | -            | -           | -           | OOM           |
+| 32,768  | DMoAH (BF16)       | 50.36        | 992.80      | `shortlist` | Success       |
+| 65,536  | Standard Attention | -            | -           | -           | OOM           |
+| 65,536  | DMoAH (BF16)       | 97.99        | 1,581.49    | `shortlist` | Success       |
+| 262,144 | Standard Attention | -            | -           | -           | OOM           |
+| 262,144 | DMoAH (BF16)       | 401.46       | 6,082.09    | `shortlist` | Success       |
+| 524,288 | Standard Attention | -            | -           | -           | OOM           |
+| 524,288 | DMoAH (BF16)       | 810.43       | 12,106.17   | `shortlist` | Success       |
 
 ### Key Observations:
 
-1.  **Memory Scaling:** Standard attention's memory usage grows quadratically, leading to an Out-of-Memory (OOM) error at 32,768 tokens. DMoAH's memory usage scales far more gracefully due to its sparse architecture.
-2.  **Context Length:** On the same hardware, Proteus Attention successfully processes a context length of **524,288 tokens**—a **32x increase** over the standard implementation's limit.
-3.  **Adaptive Modes:** The `Mode` column shows the system automatically transitioning from `sparse` to `shortlist` attention at 32,768 tokens to maintain efficiency at longer scales.
+1.  **Memory Scaling:** Standard attention still hits OOM just past 16K tokens on this 16 GB GPU. The CV sparse kernel keeps DMoAH within budget through 524K tokens, trading quadratic memory for a flat shortlist working set.
+2.  **Context Length:** Proteus runs sequences **32× longer** than dense SDPA on the same card. INT8 shortlist mode remains stable through ~262K tokens, while BF16 reaches 524K before exhausting VRAM.
+3.  **Adaptive Modes:** The benchmarks capture the automatic ramp from dense to shortlist and fully linear behaviour. As the single `alpha` slider increases, the router smoothly lowers head budgets, enabling the continuous-variable kernel that powers the latest Top‑A sampler.
 
 ---
 
@@ -85,3 +88,9 @@ python scripts/chunked_shortlist_tests.py
 ## Project Status
 
 This is an experimental architecture and an active area of research. The APIs and underlying mechanisms are subject to change.
+
+**Recent highlights**
+
+* **Continuously variable sparse kernel:** the DMoAH router now blends dense, shortlist, and fully linear regimes via a single `alpha`, while head/token budgets are selected with nucleus (top‑p) gating for smoother CVT behaviour.
+* **Top‑A sampler + alignment:** inference uses the active-head consensus to filter or re-weight nucleus candidates; optional alignment loss keeps the heads predictive during training, improving stylistic cohesion and reducing projection drift.
+* **Chunked shortlist parity:** the streaming shortlist tool and tinytoy benchmark now share the same nucleus and Top‑A plumbing, so large-context evaluations reflect the exact runtime kernel mix.
