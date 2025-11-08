@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # /examples/train_comparison.py
-# Compare Genetic Attention (DMoAH) vs Standard Attention on a tiny char dataset.
+# Compare ASPA vs Standard Attention on a tiny char dataset.
 
-from proteus_attention.models.dmoah import (
+from proteus_attention.models.aspa import (
     ModelConfig,
     AdaptiveSparseAttentionBlock,
     AdaptiveSparseAttention,
@@ -30,7 +30,7 @@ sys.path.insert(0, str(project_root / 'src'))
 
 # ------------------------------------------------------------------------------
 # Repo-relative imports (your layout)
-# models/      -> dmoah.py (AdaptiveSparseAttentionBlock, ModelConfig)
+# models/      -> aspa.py (AdaptiveSparseAttentionBlock, ModelConfig)
 # kernels/     -> sparse_attn.py, tinytoy.py  (not required here, but present)
 # examples/    -> this script
 # ------------------------------------------------------------------------------
@@ -39,7 +39,7 @@ sys.path.insert(0, str(project_root / 'src'))
 
 
 def get_device():
-    """Prefer CUDA (incl. ROCm), otherwise CPU. MPS is unsupported for Genetic Attention/DMoAH Triton kernels."""
+    """Prefer CUDA (incl. ROCm), otherwise CPU. MPS is unsupported for ASPA Triton kernels."""
     if torch.cuda.is_available():
         return torch.device("cuda")
     # MPS is not supported by Triton/your kernels; fall back to CPU if that's all there is.
@@ -146,20 +146,20 @@ class StandardAdaptiveSparseAttentionBlock(nn.Module):
 
 
 class SimpleGPT(nn.Module):
-    """Minimal GPT-ish stack with either Genetic (DMoAH) blocks or standard blocks."""
+    """Minimal GPT-ish stack with either ASPA blocks or standard blocks."""
 
-    def __init__(self, config, model_type: str = "dmoah"):
+    def __init__(self, config, model_type: str = "aspa"):
         super().__init__()
-        assert model_type in ("dmoah", "standard")
+        assert model_type in ("aspa", "standard")
         self.config = config
 
         self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
         self.pos_emb = nn.Embedding(config.n_ctx, config.d_model)
 
         blocks = []
-        if model_type == "dmoah":
+        if model_type == "aspa":
             for _ in range(config.n_layer):
-                # from models/dmoah.py
+                # from models/aspa.py
                 blocks.append(AdaptiveSparseAttentionBlock(config))
         else:
             for _ in range(config.n_layer):
@@ -227,8 +227,8 @@ def _iter_model_blocks(root: nn.Module):
                 stack.append(inner)
 
 
-def _iter_dmoah_layers(root: nn.Module):
-    """Yield Genetic Attention (DMoAH) layers from the model tree."""
+def _iter_aspa_layers(root: nn.Module):
+    """Yield ASPA layers from the model tree."""
 
     for block in _iter_model_blocks(root):
         attn = getattr(block, "attn", None)
@@ -245,8 +245,11 @@ def _iter_dmoah_layers(root: nn.Module):
                 break
 
 
+_iter_aspa_layers = _iter_aspa_layers  # backwards compatibility
+
+
 class _HeadStatsAggregator:
-    """Lightweight aggregator for Genetic Attention head telemetry across training batches."""
+    """Lightweight aggregator for ASPA head telemetry across training batches."""
 
     INTEREST_KEYS = {
         "target_k",
@@ -364,13 +367,13 @@ class SparseController:
             )
 
     def _snapshot_bounds(self) -> tuple[Optional[int], Optional[int]]:
-        layers = list(_iter_dmoah_layers(self._model))
+        layers = list(_iter_aspa_layers(self._model))
         if not layers:
             return None, None
         return layers[0].h_active_min, layers[0].h_active_max
 
     def _apply_bounds(self, min_heads: Optional[int], max_heads: Optional[int]) -> bool:
-        layers = list(_iter_dmoah_layers(self._model))
+        layers = list(_iter_aspa_layers(self._model))
         if not layers:
             return False
         changed = False
@@ -436,7 +439,7 @@ class SparseController:
         mean_target_k: Optional[float],
         density: float,
     ) -> None:
-        layers = list(_iter_dmoah_layers(self._model))
+        layers = list(_iter_aspa_layers(self._model))
         if not layers:
             return
         current_min = layers[0].h_active_min
@@ -491,7 +494,7 @@ def train_model(model: nn.Module,
                 log_head_stats: bool = True,
                 sparse_controller: Optional[SparseController] = None,
                 max_steps: Optional[int] = None) -> TrainResult:
-    """Mixed-precision friendly trainer with optional Genetic Attention telemetry/control."""
+    """Mixed-precision friendly trainer with optional ASPA telemetry/control."""
     use_cuda_amp = bool(use_amp and device.type == "cuda")
     scaler = torch.cuda.amp.GradScaler(
         enabled=use_cuda_amp) if use_cuda_amp else None
@@ -605,7 +608,7 @@ def generate_text(model: nn.Module,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train and compare Genetic Attention (DMoAH) vs Standard Attention.")
+        description="Train and compare ASPA vs Standard Attention.")
     parser.add_argument("text_file", nargs="?", default="input.txt",
                         help="Path to training text (default: input.txt; downloads Tiny Shakespeare if missing).")
     parser.add_argument("--epochs", type=int, default=1)
@@ -621,7 +624,7 @@ def main():
     parser.add_argument("--gen_tokens", type=int, default=200,
                         help="Tokens to generate after training each model.")
     parser.add_argument("--target_density", type=float, default=0.28,
-                        help="Desired average max_active_density for Genetic Attention (DMoAH) (0-1).")
+                        help="Desired average max_active_density for ASPA (0-1).")
     parser.add_argument("--density_tol", type=float, default=0.03,
                         help="Tolerance band around target density before adjustments.")
     parser.add_argument("--density_patience", type=int, default=1,
@@ -631,7 +634,7 @@ def main():
     parser.add_argument("--max_active_heads", type=int, default=0,
                         help="Override maximum active heads (0 keeps config default).")
     parser.add_argument("--dense_threshold", type=float, default=0.30,
-                        help="Force-dense threshold passed to Genetic Attention (DMoAH) (0-1).")
+                        help="Force-dense threshold passed to ASPA (0-1).")
     parser.add_argument("--no_sparse_ctrl", action="store_true",
                         help="Disable adaptive sparse controller adjustments.")
     parser.add_argument("--token_sparse", action="store_true",
@@ -644,10 +647,8 @@ def main():
                         help="Proto/importance threshold for keeping tokens.")
     parser.add_argument("--token_keep_guard", type=int, default=1,
                         help="Always keep the first N tokens in each sequence.")
-    parser.add_argument("--genetic_steps", type=int, default=0,
-                        help="Maximum training steps for the Genetic Attention run (0 uses all batches).")
-    parser.add_argument("--dmoah_steps", type=int,
-                        default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--aspa_steps", type=int, default=0,
+                        help="Maximum training steps for the ASPA run (0 uses all batches).")
     parser.add_argument("--standard_steps", type=int, default=0,
                         help="Maximum training steps for the standard baseline (0 uses all batches).")
     parser.add_argument("--summary_json", type=str, default="",
@@ -661,7 +662,7 @@ def main():
 
     print(f"Using device: {device}")
     if device.type == "cpu" and torch.backends.mps.is_available():
-        print("Note: MPS detected but DMoAH/Triton path is unsupported on MPS. Running on CPU.")
+        print("Note: MPS detected but ASPA/Triton path is unsupported on MPS. Running on CPU.")
 
     # ---------- Data ----------
     data_path = Path(args.text_file)
@@ -717,18 +718,18 @@ def main():
     token_keep_guard = max(0, args.token_keep_guard if token_sparse else 1)
 
     # ---------- Configs ----------
-    # DMoAH config mirrors your tinytoy defaults, tuned to small contexts.
-    genetic_steps = args.genetic_steps if args.genetic_steps > 0 else args.dmoah_steps
+    # ASPA config mirrors your tinytoy defaults, tuned to small contexts.
+    aspa_steps = max(0, int(getattr(args, "aspa_steps", 0) or 0))
 
-    dmoah_cfg = ModelConfig(
+    aspa_cfg = ModelConfig(
         d_model=args.d_model,
         n_layer=args.n_layer,
-        n_ctx=args.block_size,        # used by DMoAH internals (masks/curves)
+        n_ctx=args.block_size,        # used by ASPA internals (masks/curves)
         vocab_size=vocab,
         p_dropout=0.1,
         bias=False,
         use_sdpa=True,
-        # DMoAH specifics
+        # ASPA specifics
         attn_h_total=8,
         attn_h_active=max_active,
         attn_h_active_min=min_active,
@@ -746,7 +747,7 @@ def main():
         attn_token_keep_threshold=token_keep_threshold,
         attn_token_keep_guard=token_keep_guard,
     )
-    dmoah_cfg.block_size = args.block_size
+    aspa_cfg.block_size = args.block_size
 
     # Baseline config (SimpleNamespace-like)
     class StdCfg:
@@ -762,13 +763,13 @@ def main():
     std_cfg.n_head = 8  # match attn_h_total for fairness
 
     # ---------- Models ----------
-    model_dmoah = SimpleGPT(dmoah_cfg, model_type="dmoah")
+    model_aspa = SimpleGPT(aspa_cfg, model_type="aspa")
     model_std = SimpleGPT(std_cfg, model_type="standard")
 
     # Optional torch.compile (great on CUDA/ROCm; safe to skip on CPU)
     if hasattr(torch, "compile") and not args.no_compile:
         try:
-            model_dmoah = torch.compile(model_dmoah, mode="max-autotune")
+            model_aspa = torch.compile(model_aspa, mode="max-autotune")
             model_std = torch.compile(model_std, mode="max-autotune")
             print("Models compiled with torch.compile()")
         except Exception as e:
@@ -777,7 +778,7 @@ def main():
     sparse_ctrl = None
     if not args.no_sparse_ctrl:
         sparse_ctrl = SparseController(
-            model_dmoah,
+            model_aspa,
             target_density=target_density,
             tolerance=density_tol,
             patience=max(1, args.density_patience),
@@ -787,27 +788,27 @@ def main():
         )
 
     # ---------- Optimizers ----------
-    opt_dmoah = torch.optim.AdamW(model_dmoah.parameters(), lr=args.lr)
+    opt_aspa = torch.optim.AdamW(model_aspa.parameters(), lr=args.lr)
     opt_std = torch.optim.AdamW(model_std.parameters(), lr=args.lr)
 
-    # ---------- Train DMoAH ----------
-    result_dmoah = train_model(
-        model_dmoah,
+    # ---------- Train ASPA ----------
+    result_aspa = train_model(
+        model_aspa,
         loader,
-        opt_dmoah,
+        opt_aspa,
         device,
         epochs=args.epochs,
-        model_name="Genetic Attention (DMoAH)",
+        model_name="ASPA",
         use_amp=(not args.no_amp),
         log_head_stats=True,
         sparse_controller=sparse_ctrl,
-        max_steps=genetic_steps if genetic_steps > 0 else None,
+        max_steps=aspa_steps if aspa_steps > 0 else None,
     )
 
     if args.gen_tokens > 0:
-        print("\n--- DMoAH Generation ---")
+        print("\n--- ASPA Generation ---")
         generate_text(
-            model_dmoah,
+            model_aspa,
             tokenizer,
             device,
             prompt="JULIET:\nO Romeo, Romeo! wherefore art thou",
@@ -859,28 +860,28 @@ def main():
             "d_model": args.d_model,
             "n_layer": args.n_layer,
             "epochs": args.epochs,
-            "genetic_steps_cap": genetic_steps if genetic_steps > 0 else None,
+            "aspa_steps_cap": aspa_steps if aspa_steps > 0 else None,
             "standard_steps_cap": args.standard_steps if args.standard_steps > 0 else None,
             "token_sparse": bool(args.token_sparse),
         },
         "models": {
-            "dmoah": _result_summary(result_dmoah),
+            "aspa": _result_summary(result_aspa),
             "standard": _result_summary(result_standard),
         },
         "comparisons": {},
     }
 
-    d_elapsed = summary_payload["models"]["dmoah"]["elapsed_sec"]
+    d_elapsed = summary_payload["models"]["aspa"]["elapsed_sec"]
     s_elapsed = summary_payload["models"]["standard"]["elapsed_sec"]
-    d_loss = summary_payload["models"]["dmoah"]["avg_loss"]
+    d_loss = summary_payload["models"]["aspa"]["avg_loss"]
     s_loss = summary_payload["models"]["standard"]["avg_loss"]
     comp = {}
     if isinstance(d_elapsed, (int, float)) and isinstance(s_elapsed, (int, float)) and d_elapsed > 0:
-        comp["standard_over_genetic_speedup"] = s_elapsed / d_elapsed
-        comp["genetic_over_standard_speedup"] = d_elapsed / \
+        comp["standard_over_aspa_speedup"] = s_elapsed / d_elapsed
+        comp["aspa_over_standard_speedup"] = d_elapsed / \
             s_elapsed if s_elapsed > 0 else None
     if isinstance(d_loss, (int, float)) and isinstance(s_loss, (int, float)):
-        comp["loss_delta_genetic_minus_standard"] = d_loss - s_loss
+        comp["loss_delta_aspa_minus_standard"] = d_loss - s_loss
     summary_payload["comparisons"] = comp
 
     if args.summary_json:

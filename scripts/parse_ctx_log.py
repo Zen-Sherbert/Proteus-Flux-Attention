@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Parse training comparison logs into CSV (and optional plot).
 
-The script expects logs produced by ``dmoah_train.py`` where each section is
+The script expects logs produced by ``aspa_train.py`` where each section is
 headed by lines like ``=== Scenario ===`` and training summaries include the
 standard "Training finished" + "summary" lines.
 """
@@ -22,7 +22,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 SCENARIO_RE = re.compile(r"^===\s+(?P<label>.+?)\s+===\s*$")
 FINISH_RE = re.compile(r"^Training finished in (?P<elapsed>[0-9.]+)s \((?P<steps>\d+) steps\).$")
 SUMMARY_RE = re.compile(
-    r"^(?P<model>Genetic Attention \(DMoAH\)|Standard Attention) summary: "
+    r"^(?P<model>ASPA|Standard Attention) summary: "
     r"steps=(?P<steps>\d+), avg_loss=(?P<loss>[0-9.]+)"  # noqa: E501
 )
 AUTO_RE = re.compile(r"^\[AutoLog\]\s+(?P<payload>\{.+\})\s*$")
@@ -74,7 +74,7 @@ def parse_log(lines: Iterable[str]) -> Tuple[Dict[str, Dict[str, ModelRecord]], 
         summary = SUMMARY_RE.match(line)
         if summary and current_label is not None:
             model_name = summary.group("model")
-            key = "dmoah" if "Genetic" in model_name else "standard"
+            key = "aspa" if "ASPA" in model_name else "standard"
             steps = int(summary.group("steps"))
             loss = float(summary.group("loss"))
             elapsed = pending_finish["elapsed"] if pending_finish else None
@@ -163,22 +163,22 @@ def maybe_plot(path: Path, scenarios: Dict[str, Dict[str, ModelRecord]]) -> None
         print("No scenarios to plot.", file=sys.stderr)
         return
 
-    d_vals: List[float] = []
+    aspa_vals: List[float] = []
     s_vals: List[float] = []
     for label in labels:
-        d_elapsed = scenarios[label].get("dmoah")
+        d_elapsed = scenarios[label].get("aspa")
         s_elapsed = scenarios[label].get("standard")
-        d_vals.append(d_elapsed.elapsed_sec if d_elapsed and d_elapsed.elapsed_sec is not None else math.nan)
+        aspa_vals.append(d_elapsed.elapsed_sec if d_elapsed and d_elapsed.elapsed_sec is not None else math.nan)
         s_vals.append(s_elapsed.elapsed_sec if s_elapsed and s_elapsed.elapsed_sec is not None else math.nan)
 
     width = 0.35
     xs = range(len(labels))
 
     plt.figure(figsize=(max(6, len(labels) * 2.5), 4))
-    plt.bar([x - width / 2 for x in xs], d_vals, width, label="Genetic")
+    plt.bar([x - width / 2 for x in xs], aspa_vals, width, label="ASPA")
     plt.bar([x + width / 2 for x in xs], s_vals, width, label="Standard")
     plt.ylabel("Elapsed seconds (20k steps)")
-    plt.title("Genetic Attention vs Standard Training Time")
+    plt.title("ASPA vs Standard Training Time")
     plt.xticks(list(xs), labels, rotation=20, ha="right")
     plt.legend()
     plt.tight_layout()
@@ -188,7 +188,7 @@ def maybe_plot(path: Path, scenarios: Dict[str, Dict[str, ModelRecord]]) -> None
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Parse Genetic Attention (DMoAH) comparison log into CSV/plot.")
+    parser = argparse.ArgumentParser(description="Parse ASPA vs dense comparison logs into CSV/plot.")
     parser.add_argument("log", type=Path, help="Path to the text log file.")
     parser.add_argument("--csv-out", type=Path, default=None, help="Where to write the CSV summary.")
     parser.add_argument("--plot-out", type=Path, default=None, help="Optional PNG path for a runtime bar chart.")

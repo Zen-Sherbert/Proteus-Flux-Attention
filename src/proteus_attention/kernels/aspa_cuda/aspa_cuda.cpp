@@ -115,7 +115,7 @@ Tensor ensure_bool_mask(const c10::optional<Tensor>& mask_opt,
 
 }  // namespace
 
-Tensor dmoah_sparse_attention(
+Tensor aspa_sparse_attention(
     Tensor q,
     Tensor k,
     Tensor v,
@@ -344,8 +344,8 @@ Tensor dmoah_sparse_attention(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
-        "dmoah_sparse_attention",
-        &dmoah_sparse_attention,
+        "aspa_sparse_attention",
+        &aspa_sparse_attention,
         py::arg("q"),
         py::arg("k"),
         py::arg("v"),
@@ -356,5 +356,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("prepacked") = py::none(),
         py::arg("flux_candidates") = py::none(),
         py::arg("flux_lengths") = py::none(),
-        "CUDA-backed sparse attention fallback for DMoAH.");
+        "CUDA-backed sparse attention fallback for ASPA.");
 }

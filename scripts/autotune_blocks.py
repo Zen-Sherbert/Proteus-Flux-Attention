@@ -16,7 +16,7 @@ from typing import Sequence
 
 import torch
 
-from proteus_attention.modules import CausalGeneticMultiheadAttention
+from proteus_attention.modules import CausalASPAMultiheadAttention
 from proteus_attention.kernels.sparse_attn import get_block_config_cache
 
 
@@ -69,7 +69,7 @@ def main() -> None:
 
     for head_dim in head_dims:
         embed_dim = head_dim * args.num_heads
-        model = CausalGeneticMultiheadAttention(
+        model = CausalASPAMultiheadAttention(
             embed_dim=embed_dim,
             num_heads=args.num_heads,
             batch_first=True,

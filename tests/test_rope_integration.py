@@ -1,6 +1,6 @@
 import torch
 
-from proteus_attention.models.dmoah import AdaptiveSparseAttention, ModelConfig
+from proteus_attention.models.aspa import AdaptiveSparseAttention, ModelConfig
 
 
 def test_rope_checkpoint_roundtrip(tmp_path):
@@ -10,7 +10,7 @@ def test_rope_checkpoint_roundtrip(tmp_path):
         n_layer=1,
         n_head=4,
         d_model=128,
-        attn_variant="dmoah",
+        attn_variant="aspa",
         attn_use_rope=True,
     )
     model = AdaptiveSparseAttention(config)

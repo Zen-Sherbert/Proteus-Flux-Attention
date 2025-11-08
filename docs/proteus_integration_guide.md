@@ -29,7 +29,7 @@ metrics/checkpoints under the run directory.
 ## 2. Patch the Model Class
 
 1. Subclass the Hugging Face decoder block so that each attention layer uses
-   `proteus_attention.modules.CausalGeneticMultiheadAttention` (drop-in MHA) or
+   `proteus_attention.modules.CausalASPAMultiheadAttention` (drop-in MHA) or
    the lower-level `AdaptiveSparseAttentionBlock`.
 2. Extend the config class to surface the Proteus-specific knobs
    (`attn_proto_*`, `shortlist_alpha`, etc.).

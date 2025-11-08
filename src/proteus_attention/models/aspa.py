@@ -19,7 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..kernels.sparse_attn import (
-    dmoah_sparse_attention,
+    aspa_sparse_attention,
     get_last_backend,
     get_last_backend_info,
     build_shortlist_candidates,
@@ -32,7 +32,8 @@ from ..kernels.sparse_attn import (
 
 class ModelConfig:
     """
-    Minimal, flexible configuration container used by the DMoAH modules.
+    Minimal, flexible configuration container used by the ASPA modules (built
+    on the Dynamic Mixture-of-Attention-Heads routing stack).
 
     The class intentionally behaves like a simple attribute bag so that callers
     can freely set new attributes without needing an exhaustive schema.
@@ -168,11 +169,12 @@ def _get_causal_mask(target_len: int, device: torch.device, dtype: torch.dtype) 
 
 class AdaptiveSparseAttention(nn.Module):
     """
-    Dynamic Mixture-of-Attention-Heads (DMoAH).
+    Adaptive Sparse Proto Attention (ASPA).
 
-    This module replaces the standard Multi-Head Attention. It uses a router to
-    select a small subset of "active" heads for each token, enabling massive
-    scalability in the total number of heads.
+    This module replaces standard Multi-Head Attention. It uses the Dynamic
+    Mixture-of-Attention-Heads router to select a small subset of "active" heads
+    for each token, enabling massive scalability while keeping the prototype
+    semantics exposed to higher-level controllers.
     """
 
     def __init__(self, config: ModelConfig):
@@ -181,7 +183,7 @@ class AdaptiveSparseAttention(nn.Module):
         self.d_model = config.d_model
         self.bias = bool(getattr(config, "bias", False))
 
-        # --- DMoAH configuration ---
+        # --- ASPA routing configuration ---
         total_heads_hint = int(
             getattr(config, "attn_h_total", 0) or getattr(config, "n_head", 1) or 1)
         if total_heads_hint <= 0:
@@ -1282,7 +1284,7 @@ class AdaptiveSparseAttention(nn.Module):
         )
 
         self._last_shortlist_backend_info = None
-        attn_sparse = dmoah_sparse_attention(
+        attn_sparse = aspa_sparse_attention(
             q_input,
             k_input,
             v_input,
@@ -1584,7 +1586,7 @@ class AdaptiveSparseAttention(nn.Module):
         self._last_target_k = topk
         if topk <= 0:
             raise RuntimeError(
-                "DMoAH requires at least one active head per token")
+                "ASPA requires at least one active head per token")
         head_scores, top_head_indices = torch.topk(
             head_probs, topk, dim=-1)  # (B, T, h_active)
 
@@ -1664,7 +1666,7 @@ class AdaptiveSparseAttention(nn.Module):
             self._cached_packing = None
             if causal_mask is None:
                 causal_mask = self._causal_mask(T, device, q_flat.dtype)
-            attn_flat = dmoah_sparse_attention(
+            attn_flat = aspa_sparse_attention(
                 q_flat,
                 k_flat,
                 v_flat,
@@ -1987,4 +1989,4 @@ class AdaptiveSparseAttentionBlock(nn.Module):
         self.last_sparse_state = getattr(self.attn, '_last_sparse_state', None)
         return x
 
-# NOTE: DMoAH blocks remain experimental; monitor training stability when enabling.
+# NOTE: ASPA blocks remain experimental; monitor training stability when enabling.

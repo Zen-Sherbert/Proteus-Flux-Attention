@@ -2,14 +2,14 @@ import pytest
 import torch
 import torch.nn as nn
 
-from proteus_attention.modules import CausalGeneticMultiheadAttention, SparseHeadController
-from proteus_attention.modules import CausalGeneticTransformerBlock
+from proteus_attention.modules import CausalASPAMultiheadAttention, SparseHeadController
+from proteus_attention.modules import CausalASPATransformerBlock
 
 
 @pytest.mark.parametrize("batch_first", [True, False])
-def test_causal_genetic_multihead_shapes(batch_first: bool):
+def test_causal_aspa_multihead_shapes(batch_first: bool):
     torch.manual_seed(0)
-    mha = CausalGeneticMultiheadAttention(
+    mha = CausalASPAMultiheadAttention(
         embed_dim=32,
         num_heads=4,
         dropout=0.1,
@@ -31,9 +31,9 @@ def test_causal_genetic_multihead_shapes(batch_first: bool):
         assert weights.shape == (2, 16, 16)
 
 
-def test_causal_genetic_multihead_key_padding_mask():
+def test_causal_aspa_multihead_key_padding_mask():
     torch.manual_seed(0)
-    mha = CausalGeneticMultiheadAttention(
+    mha = CausalASPAMultiheadAttention(
         embed_dim=16,
         num_heads=2,
         batch_first=True,
@@ -52,10 +52,10 @@ def test_causal_genetic_multihead_key_padding_mask():
     assert torch.allclose(out[2], torch.zeros_like(out[2]), atol=1e-5)
 
 
-def test_causal_genetic_multihead_cross_attn_matches_torch():
+def test_causal_aspa_multihead_cross_attn_matches_torch():
     torch.manual_seed(1)
     embed_dim, num_heads = 16, 4
-    mha = CausalGeneticMultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, batch_first=True, dropout=0.0)
+    mha = CausalASPAMultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, batch_first=True, dropout=0.0)
     reference = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, batch_first=True, dropout=0.0)
     reference.load_state_dict(mha.fallback_attention.state_dict())
 
@@ -70,18 +70,18 @@ def test_causal_genetic_multihead_cross_attn_matches_torch():
     assert weights is not None and torch.allclose(weights, expected_weights, atol=1e-6)
 
 
-def test_causal_genetic_multihead_accepts_standard_causal_mask():
-    mha = CausalGeneticMultiheadAttention(embed_dim=8, num_heads=1)
+def test_causal_aspa_multihead_accepts_standard_causal_mask():
+    mha = CausalASPAMultiheadAttention(embed_dim=8, num_heads=1)
     x = torch.randn(2, 4, 8)
     causal_mask = torch.triu(torch.ones(4, 4, dtype=torch.bool), diagonal=1)
     out, _ = mha(x, attn_mask=causal_mask, need_weights=False)
     assert out.shape == x.shape
 
 
-def test_causal_genetic_multihead_handles_custom_mask_with_fallback():
+def test_causal_aspa_multihead_handles_custom_mask_with_fallback():
     torch.manual_seed(2)
     embed_dim = 12
-    mha = CausalGeneticMultiheadAttention(embed_dim=embed_dim, num_heads=3, batch_first=True, dropout=0.0)
+    mha = CausalASPAMultiheadAttention(embed_dim=embed_dim, num_heads=3, batch_first=True, dropout=0.0)
 
     x = torch.randn(3, 6, embed_dim)
     custom_mask = torch.full((6, 6), float("-inf"))
@@ -112,8 +112,8 @@ def test_causal_genetic_multihead_handles_custom_mask_with_fallback():
     assert weights is not None and torch.allclose(weights, ref_w, atol=1e-6)
 
 
-def test_causal_genetic_multihead_runtime_stats_toggle():
-    mha = CausalGeneticMultiheadAttention(embed_dim=8, num_heads=1, return_stats_default=False)
+def test_causal_aspa_multihead_runtime_stats_toggle():
+    mha = CausalASPAMultiheadAttention(embed_dim=8, num_heads=1, return_stats_default=False)
     x = torch.randn(2, 4, 8)
     out, _ = mha(x, need_weights=False, return_stats=True)
     assert out.shape == x.shape
@@ -140,7 +140,7 @@ def test_sparse_head_controller_decrease_path():
 
 def test_multihead_with_sparse_controller_collects_stats():
     torch.manual_seed(0)
-    mha = CausalGeneticMultiheadAttention(
+    mha = CausalASPAMultiheadAttention(
         embed_dim=32,
         num_heads=4,
         batch_first=True,
@@ -157,9 +157,9 @@ def test_multihead_with_sparse_controller_collects_stats():
         assert "action" in stats["sparse_ctl"]
 
 
-def test_genetic_attention_random_forward_outputs_finite():
+def test_aspa_attention_random_forward_outputs_finite():
     torch.manual_seed(42)
-    mha = CausalGeneticMultiheadAttention(
+    mha = CausalASPAMultiheadAttention(
         embed_dim=48,
         num_heads=6,
         dropout=0.1,
@@ -178,17 +178,19 @@ def test_genetic_attention_random_forward_outputs_finite():
     assert "head_stats" in stats
 
 
-def test_genetic_attention_backward_propagates_gradients():
+def test_aspa_attention_backward_propagates_gradients():
     torch.manual_seed(7)
-    mha = CausalGeneticMultiheadAttention(embed_dim=32, num_heads=4, batch_first=True)
+    mha = CausalASPAMultiheadAttention(embed_dim=32, num_heads=4, batch_first=True)
     x = torch.randn(2, 10, 32, requires_grad=True)
     out, _ = mha(x, need_weights=False)
     loss = out.pow(2).mean()
     loss.backward()
     assert x.grad is not None
     assert torch.isfinite(x.grad).all()
-def test_causal_genetic_multihead_fallback_populates_stats():
-    mha = CausalGeneticMultiheadAttention(embed_dim=8, num_heads=1, return_stats_default=True)
+
+
+def test_causal_aspa_multihead_fallback_populates_stats():
+    mha = CausalASPAMultiheadAttention(embed_dim=8, num_heads=1, return_stats_default=True)
     q = torch.randn(1, 3, 8)
     k = torch.randn(1, 3, 8)
     out, _ = mha(q, key=k, value=k, need_weights=False, is_causal=False)
@@ -198,9 +200,9 @@ def test_causal_genetic_multihead_fallback_populates_stats():
     assert stats["shortlist_backend"]["name"] == "torch.nn.MultiheadAttention"
 
 
-def test_causal_genetic_transformer_block_forward_backward():
+def test_causal_aspa_transformer_block_forward_backward():
     torch.manual_seed(0)
-    block = CausalGeneticTransformerBlock(
+    block = CausalASPATransformerBlock(
         embed_dim=32,
         num_heads=4,
         dim_feedforward=64,

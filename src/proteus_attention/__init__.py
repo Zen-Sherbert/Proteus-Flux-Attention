@@ -1,22 +1,22 @@
 """
-Proteus Attention package: Genetic Attention reference implementation powered by
-the Dynamic Mixture-of-Attention-Heads (DMoAH) architecture.
+Proteus Attention package: Adaptive Sparse Proto Attention (ASPA) reference
+implementation powered by the Dynamic Mixture-of-Attention-Heads architecture.
 
 This module exposes the primary building blocks so downstream projects can
-install ``proteus-attention`` and import Genetic Attention kernels or models
-directly while still accessing the DMoAH internals when needed.
+install ``proteus-attention`` and import ASPA kernels or models directly while
+still accessing the underlying sparsity controls when needed.
 """
 
-from .models.dmoah import (
+from .models.aspa import (
     AdaptiveSparseAttentionBlock,
     AdaptiveSparseAttention,
     AdaptiveSparseProtoAttention,
     MLP,
     ModelConfig,
 )
-from .modules import CausalGeneticMultiheadAttention
+from .modules import CausalASPAMultiheadAttention
 from .kernels.sparse_attn import (
-    dmoah_sparse_attention,
+    aspa_sparse_attention,
     get_last_backend,
     get_last_backend_info,
 )
@@ -31,10 +31,10 @@ __all__ = [
     "AdaptiveSparseAttentionBlock",
     "AdaptiveSparseAttention",
     "AdaptiveSparseProtoAttention",
-    "CausalGeneticMultiheadAttention",
+    "aspa_sparse_attention",
+    "CausalASPAMultiheadAttention",
     "MLP",
     "ModelConfig",
-    "dmoah_sparse_attention",
     "get_last_backend",
     "get_last_backend_info",
     "ChunkedShortlistConfig",

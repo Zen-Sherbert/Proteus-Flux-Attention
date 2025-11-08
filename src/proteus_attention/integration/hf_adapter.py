@@ -8,7 +8,7 @@ alpha updates).
 
 To integrate with a particular family (e.g. Gemma, LLaMA, etc.) replace the
 ``ModelAdapter`` methods with logic that swaps the native attention blocks for
-``proteus_attention.modules.CausalGeneticMultiheadAttention`` and configures
+``proteus_attention.modules.CausalASPAMultiheadAttention`` and configures
 prototype/controller parameters appropriately.
 """
 

@@ -23,7 +23,7 @@ if SRC_ROOT.exists():
 
 import torch
 
-from proteus_attention.models.dmoah import AdaptiveSparseAttention, ModelConfig
+from proteus_attention.models.aspa import AdaptiveSparseAttention, ModelConfig
 
 
 @dataclass

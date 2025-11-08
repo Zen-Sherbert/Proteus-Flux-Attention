@@ -96,6 +96,18 @@ def _parse_args() -> argparse.Namespace:
         help="PRNG seed for the synthetic input.",
     )
     parser.add_argument(
+        "--shortlist-alpha",
+        type=float,
+        default=1.0,
+        help="Shortlist alpha slider (0=dense, 1=fully sparse).",
+    )
+    parser.add_argument(
+        "--nucleus-top-p",
+        type=float,
+        default=0.9,
+        help="Top-p (nucleus) filter applied when selecting tokens per chunk.",
+    )
+    parser.add_argument(
         "--report-latency",
         action="store_true",
         help="Capture CUDA event timings for streaming and final passes.",
@@ -104,6 +116,12 @@ def _parse_args() -> argparse.Namespace:
         "--no-final-pass",
         action="store_true",
         help="Skip the final attention pass to measure streaming alone.",
+    )
+    parser.add_argument(
+        "--ram-limit-mb",
+        type=int,
+        default=None,
+        help="Cap host RAM usage (MB) before spilling to disk when storage=auto.",
     )
     return parser.parse_args()
 
@@ -118,6 +136,7 @@ def main() -> None:
     args = _parse_args()
     os.environ.setdefault("PROTEUS_TUNE_DISABLE", "1")
     device = _resolve_device(args.device)
+    ram_limit_bytes = int(args.ram_limit_mb * 1024 * 1024) if args.ram_limit_mb else None
 
     config = ChunkedShortlistConfig(
         seq_len=args.seq_len,
@@ -135,6 +154,9 @@ def main() -> None:
         run_final_pass=not args.no_final_pass,
         storage=args.storage,
         temp_dir=args.temp_dir,
+        shortlist_alpha=args.shortlist_alpha,
+        nucleus_top_p=args.nucleus_top_p,
+        ram_limit_bytes=ram_limit_bytes,
     )
 
     runner = ChunkedShortlistRunner(config)
@@ -158,6 +180,15 @@ def main() -> None:
         print(f"final peak memory   : {metrics.peak_memory_mb:.1f} MB")
     if metrics.total_tokens_per_s is not None:
         print(f"overall throughput  : {metrics.total_tokens_per_s:,.2f} tok/s")
+    print(f"storage mode        : {metrics.storage_mode}")
+    if metrics.storage_reason:
+        print(f"storage reasoning   : {metrics.storage_reason}")
+    if metrics.host_required_mb is not None:
+        print(f"host required (MB)  : {metrics.host_required_mb:.1f}")
+    if metrics.host_allocated_mb is not None:
+        print(f"host allocated (MB) : {metrics.host_allocated_mb:.1f}")
+    if metrics.host_limit_mb is not None:
+        print(f"host limit (MB)     : {metrics.host_limit_mb:.1f}")
     print("==============================\n")
 
 

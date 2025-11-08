@@ -5,7 +5,7 @@ Re-export key transformer components so that consumers can import from
 `proteus_attention.models` without diving into implementation files.
 """
 
-from .dmoah import (
+from .aspa import (
     AdaptiveSparseAttentionBlock,
     AdaptiveSparseAttention,
     AdaptiveSparseProtoAttention,

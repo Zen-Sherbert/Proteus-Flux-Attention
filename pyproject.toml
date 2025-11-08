@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "proteus-attention"
 version = "0.1.0"
-description = "Genetic Attention modules powered by the Dynamic Mixture-of-Attention-Heads (DMoAH) architecture."
+description = "Adaptive Sparse Proto Attention (ASPA) modules powered by the Dynamic Mixture-of-Attention-Heads architecture."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Scott Dietz" }]

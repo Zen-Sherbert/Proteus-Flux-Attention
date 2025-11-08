@@ -20,7 +20,10 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - optional dependency
+    np = None
 import torch
 import torch.nn.functional as F
 
@@ -28,8 +31,10 @@ if __package__ is None or __package__ == "":  # pragma: no cover - direct execut
     import sys
 
     ROOT = Path(__file__).resolve().parents[1]
-    if str(ROOT) not in sys.path:
-        sys.path.insert(0, str(ROOT))
+    SRC_ROOT = ROOT / "src"
+    for candidate in (SRC_ROOT, ROOT):
+        if str(candidate) not in sys.path:
+            sys.path.insert(0, str(candidate))
     import examples.common as common  # type: ignore
     from examples.modeling import MiniProteusLM, ModelConfig  # type: ignore
 else:  # pragma: no cover - package execution
@@ -64,6 +69,7 @@ def run_training(
     grad_accum_steps: int = 1,
     val_fraction: float = 0.1,
     val_iters: int = 2,
+    val_interval: int = 1,
     use_amp: bool = True,
     seq_growth_factor: float = 1.5,
     warmup_steps: int = 0,
@@ -75,10 +81,12 @@ def run_training(
     top_a_threshold: Optional[float] = None,
     top_a_train_weight: float = 0.0,
     top_a_train_tau: float = 0.7,
+    ema_decay: float = 0.999,
 ) -> dict:
     torch.manual_seed(1337)
     random.seed(1337)
-    np.random.seed(1337)
+    if np is not None:
+        np.random.seed(1337)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
@@ -181,6 +189,7 @@ def run_training(
     seq_growth_factor = max(1.0, float(seq_growth_factor))
     val_fraction = float(max(0.0, min(0.5, val_fraction)))
     val_iters = max(1, int(val_iters)) if val_fraction > 0.0 else 0
+    val_interval = max(1, int(val_interval)) if val_fraction > 0.0 else 0
     warmup_steps = max(0, int(warmup_steps))
     plateau_window = max(1, int(plateau_window))
     NUDGE_FACTOR = 1.15
@@ -217,7 +226,10 @@ def run_training(
     bucket_labels = [label for label, _ in bucket_configs]
 
     model = MiniProteusLM(model_cfg).to(device)
-    ema_helper = common.EMA(model, decay=0.999)
+    ema_decay = float(ema_decay)
+    if ema_decay > 0.0 and not (0.0 < ema_decay < 1.0):
+        raise ValueError("EMA decay must be in (0, 1) or set to 0 to disable.")
+    ema_helper = common.EMA(model, decay=ema_decay) if ema_decay > 0.0 else None
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     total_sched_steps = max(1, steps)
     if warmup_steps > 0 and warmup_steps < total_sched_steps:
@@ -244,9 +256,10 @@ def run_training(
     def _snapshot_rng_state() -> dict[str, object]:
         state: dict[str, object] = {
             "python": random.getstate(),
-            "numpy": np.random.get_state(),
             "torch": torch.get_rng_state(),
         }
+        if np is not None:
+            state["numpy"] = np.random.get_state()
         if torch.cuda.is_available():
             state["cuda"] = torch.cuda.get_rng_state_all()
         return state
@@ -260,7 +273,11 @@ def run_training(
             "optimizer": opt.state_dict(),
             "scheduler": scheduler.state_dict(),
             "scaler": scaler.state_dict(),
-            "ema_shadow": {name: tensor.clone() for name, tensor in ema_helper.shadow.items()},
+            "ema_shadow": (
+                {name: tensor.clone() for name, tensor in ema_helper.shadow.items()}
+                if ema_helper is not None
+                else None
+            ),
             "rng_state": _snapshot_rng_state(),
         }
 
@@ -319,7 +336,8 @@ def run_training(
             return collected
 
         bucket_stats: dict[str, tuple[float, float]] = {}
-        with ema_helper.swap(model):
+        swap_ctx = ema_helper.swap(model) if ema_helper is not None else contextlib.nullcontext()
+        with swap_ctx:
             model.eval()
             with torch.no_grad():
                 match_losses = _gather_losses(current_seq_len)
@@ -348,6 +366,13 @@ def run_training(
             "fixed": fixed_summary,
             "buckets": bucket_stats,
         }
+
+    def _should_run_validation(step_idx: int) -> bool:
+        if val_interval <= 0:
+            return False
+        if step_idx == 1 or step_idx == steps:
+            return True
+        return (step_idx % val_interval) == 0
 
     model.train()
     for step in range(1, steps + 1):
@@ -403,7 +428,8 @@ def run_training(
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(opt)
         scaler.update()
-        ema_helper.update(model)
+        if ema_helper is not None:
+            ema_helper.update(model)
         scheduler.step()
         if lr_nudge_steps_remaining > 0:
             lr_nudge_steps_remaining -= 1
@@ -436,7 +462,7 @@ def run_training(
             continue
         ppl = float(math.exp(min(30.0, loss_value)))
 
-        val_metrics = _run_validation(seq_len)
+        val_metrics = _run_validation(seq_len) if _should_run_validation(step) else None
         match_loss: Optional[float] = None
         match_ppl: Optional[float] = None
         fixed_loss: Optional[float] = None
@@ -652,6 +678,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-accum-steps", type=int, default=4, help="Micro-batches to accumulate before each optimizer step.")
     parser.add_argument("--val-fraction", type=float, default=0.1, help="Fraction of tokens reserved for validation (0 disables validation).")
     parser.add_argument("--val-iters", type=int, default=2, help="Validation batches sampled each step.")
+    parser.add_argument("--val-interval", type=int, default=1, help="Steps between validation sweeps (1 runs validation every step).")
     parser.add_argument("--no-amp", action="store_true", help="Disable CUDA automatic mixed precision.")
     parser.add_argument("--seq-growth-factor", type=float, default=1.25, help="Multiplier applied to sequence length when plateaus occur.")
     parser.add_argument("--warmup-steps", type=int, default=200, help="Number of linear warmup steps before cosine decay.")
@@ -662,6 +689,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--top-a-threshold", type=float, default=None, help="Agreement threshold for filter mode.")
     parser.add_argument("--top-a-train-weight", type=float, default=0.0, help="Weight applied to the consensus alignment loss.")
     parser.add_argument("--top-a-train-tau", type=float, default=0.7, help="Temperature for the consensus alignment loss.")
+    parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay (set 0 to disable the moving average to save memory).")
     return parser.parse_args()
 
 
@@ -687,6 +715,7 @@ def main() -> None:
         grad_accum_steps=args.grad_accum_steps,
         val_fraction=args.val_fraction,
         val_iters=args.val_iters,
+        val_interval=args.val_interval,
         use_amp=not args.no_amp,
         seq_growth_factor=args.seq_growth_factor,
         warmup_steps=args.warmup_steps,
@@ -698,6 +727,7 @@ def main() -> None:
         top_a_threshold=args.top_a_threshold,
         top_a_train_weight=args.top_a_train_weight,
         top_a_train_tau=args.top_a_train_tau,
+        ema_decay=args.ema_decay,
     )
 
 

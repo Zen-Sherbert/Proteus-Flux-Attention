@@ -24,9 +24,9 @@ class SparseHeadController:
     """
     Lightweight controller that nudges ``AdaptiveSparseProtoAttention`` head budgets toward
     a desired active density.  The implementation mirrors the example training loop
-    (`examples/dmoah_train.py`) but keeps the API minimal so modules can use it directly.
+    (`examples/aspa_train.py`) but keeps the API minimal so modules can use it directly.
 
-    Defaults mirror the CLI defaults used in ``dmoah_train.py`` (target density 0.28 with a
+    Defaults mirror the CLI defaults used in ``aspa_train.py`` (target density 0.28 with a
     ±0.03 band evaluated every 4 observations).
     """
 

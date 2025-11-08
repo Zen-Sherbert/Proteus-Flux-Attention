@@ -1,5 +1,5 @@
 """
-High-level Transformer block built around :class:`CausalGeneticMultiheadAttention`.
+High-level Transformer block built around :class:`CausalASPAMultiheadAttention`.
 
 The module mirrors the constructor and forward behaviour of PyTorch's
 ``nn.TransformerEncoderLayer`` (in ``batch_first=True`` mode) so downstream
@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .genetic_multihead import CausalGeneticMultiheadAttention
+from .aspa_multihead import CausalASPAMultiheadAttention
 
 
 def _get_activation_fn(name: str) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -28,10 +28,10 @@ def _get_activation_fn(name: str) -> Callable[[torch.Tensor], torch.Tensor]:
     raise ValueError(f"Unsupported activation '{name}'.")
 
 
-class CausalGeneticTransformerBlock(nn.Module):
+class CausalASPATransformerBlock(nn.Module):
     """
     Transformer encoder block that mirrors ``nn.TransformerEncoderLayer`` while
-    routing attention through :class:`CausalGeneticMultiheadAttention`.
+    routing attention through :class:`CausalASPAMultiheadAttention`.
 
     Parameters are kept as close as possible to the PyTorch baseline so existing
     models can switch with minimal edits.
@@ -53,7 +53,7 @@ class CausalGeneticTransformerBlock(nn.Module):
         attn_args = dict(attention_kwargs or {})
         attn_args.setdefault("batch_first", True)
         attn_args.setdefault("dropout", dropout)
-        self.self_attn = CausalGeneticMultiheadAttention(
+        self.self_attn = CausalASPAMultiheadAttention(
             embed_dim=embed_dim,
             num_heads=num_heads,
             **attn_args,
@@ -83,7 +83,7 @@ class CausalGeneticTransformerBlock(nn.Module):
         Forward pass with the same signature as ``nn.TransformerEncoderLayer``.
 
         Additional keyword arguments are forwarded to
-        :class:`CausalGeneticMultiheadAttention`.
+        :class:`CausalASPAMultiheadAttention`.
         """
 
         residual = src
@@ -114,6 +114,4 @@ class CausalGeneticTransformerBlock(nn.Module):
         if return_attn:
             return src, attn_weights
         return src
-
-
-__all__ = ["CausalGeneticTransformerBlock"]
+__all__ = ["CausalASPATransformerBlock"]

@@ -27,7 +27,7 @@ import numpy as np
 import torch
 
 from proteus_attention.kernels.sparse_attn import get_last_backend_info
-from proteus_attention.models.dmoah import AdaptiveSparseAttention, ModelConfig
+from proteus_attention.models.aspa import AdaptiveSparseAttention, ModelConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -104,7 +104,7 @@ def _build_model_config(
         d_model=d_model,
         p_dropout=0.0,
         bias=False,
-        attn_variant="dmoah",
+        attn_variant="aspa",
         attn_h_total=heads,
         attn_h_active=heads,
         attn_h_active_min=heads,

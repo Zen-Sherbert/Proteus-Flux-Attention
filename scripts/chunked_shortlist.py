@@ -78,10 +78,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-sparse-ratio", type=float, default=0.05, help="Keep ratio used in the chunk streaming stage.")
     parser.add_argument("--final-sparse-ratio", type=float, default=0.5, help="Keep ratio for the final pass.")
     parser.add_argument("--seed", type=int, default=7, help="Seed used when generating synthetic inputs.")
+    parser.add_argument("--shortlist-alpha", type=float, default=1.0, help="Shortlist alpha slider (0=dense, 1=linear shortlist).")
+    parser.add_argument("--nucleus-top-p", type=float, default=0.9, help="Top-p (nucleus) filter applied during chunk promotion.")
     parser.add_argument("--device", default=None, help="Target device (defaults to CUDA if available).")
     parser.add_argument("--progress", action="store_true", help="Display chunk progress (requires tqdm).")
     parser.add_argument("--report-latency", action="store_true", help="Capture CUDA events for runtime metrics.")
     parser.add_argument("--no-final-pass", action="store_true", help="Skip the final attention pass.")
+    parser.add_argument("--storage", choices=["auto", "cpu", "disk"], default="auto", help="Where to stage the streamed sequence (cpu/disk/auto).")
+    parser.add_argument("--temp-dir", type=Path, help="Scratch directory used when spilling chunks to disk.")
+    parser.add_argument("--ram-limit-mb", type=int, help="Soft cap for host RAM usage; spill to disk when exceeded.")
     parser.add_argument("--input", type=Path, help="Optional input tensor (.pt or .npy) with shape (1, seq_len, d_model).")
     parser.add_argument("--save-indices", type=Path, help="Optional path to save the retained indices (.pt).")
     parser.add_argument("--save-reduced", type=Path, help="Optional path to save the reduced sequence (.pt).")
@@ -114,6 +119,8 @@ def main() -> None:
         sequence = _load_sequence(Path(args.input), seq_len=args.seq_len, d_model=args.d_model)
         logging.info("Loaded input tensor from %s", args.input)
 
+    ram_limit_bytes = int(args.ram_limit_mb * 1024 * 1024) if args.ram_limit_mb else None
+
     config = ChunkedShortlistConfig(
         seq_len=args.seq_len,
         d_model=args.d_model,
@@ -128,6 +135,11 @@ def main() -> None:
         report_latency=args.report_latency,
         progress=args.progress,
         run_final_pass=not args.no_final_pass,
+        shortlist_alpha=args.shortlist_alpha,
+        nucleus_top_p=args.nucleus_top_p,
+        storage=args.storage,
+        temp_dir=args.temp_dir,
+        ram_limit_bytes=ram_limit_bytes,
     )
 
     runner = ChunkedShortlistRunner(config)
@@ -153,6 +165,15 @@ def main() -> None:
         logging.info("Final pass peak memory: %.1f MB", metrics.peak_memory_mb)
     if metrics.total_tokens_per_s is not None:
         logging.info("Overall throughput: %.2f tok/s", metrics.total_tokens_per_s)
+    logging.info("Storage mode: %s", metrics.storage_mode)
+    if metrics.storage_reason:
+        logging.info("Storage reasoning: %s", metrics.storage_reason)
+    if metrics.host_required_mb is not None:
+        logging.info("Host requirement: %.1f MB", metrics.host_required_mb)
+    if metrics.host_allocated_mb is not None:
+        logging.info("Host allocated: %.1f MB", metrics.host_allocated_mb)
+    if metrics.host_limit_mb is not None:
+        logging.info("Host limit: %.1f MB", metrics.host_limit_mb)
 
     if args.save_indices:
         _save_tensor(Path(args.save_indices), result.keep_indices)

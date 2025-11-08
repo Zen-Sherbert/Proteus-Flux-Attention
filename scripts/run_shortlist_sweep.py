@@ -19,7 +19,7 @@ import torch
 from proteus_attention.tools.chunked_shortlist import (
     ChunkedShortlistConfig,
     ChunkedShortlistRunner,
-    MAX_FLUX_CHUNK_TOKENS,
+    MAX_SHORTLIST_CHUNK_TOKENS,
 )
 
 
@@ -69,8 +69,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--chunk-len",
         type=int,
-        default=MAX_FLUX_CHUNK_TOKENS,
-        help=f"Streaming chunk length (capped at {MAX_FLUX_CHUNK_TOKENS}).",
+        default=MAX_SHORTLIST_CHUNK_TOKENS,
+        help=f"Streaming chunk length (capped at {MAX_SHORTLIST_CHUNK_TOKENS}).",
     )
     parser.add_argument(
         "--per-chunk-budget", type=int, default=4_096, help="Tokens promoted per chunk."
@@ -89,9 +89,51 @@ def parse_args() -> argparse.Namespace:
         help="Buffer ratios for each step (1M..10M).",
     )
     parser.add_argument(
+        "--heads",
+        type=int,
+        default=8,
+        help="Attention heads for shortlist passes.",
+    )
+    parser.add_argument(
+        "--chunk-sparse-ratio",
+        type=float,
+        default=0.05,
+        help="Keep ratio for the streaming stage.",
+    )
+    parser.add_argument(
+        "--final-sparse-ratio",
+        type=float,
+        default=0.5,
+        help="Keep ratio during the final pass.",
+    )
+    parser.add_argument(
+        "--nucleus-top-p",
+        type=float,
+        default=0.9,
+        help="Top-p (nucleus) filtering used when selecting chunk tokens.",
+    )
+    parser.add_argument(
         "--report-latency",
         action="store_true",
         help="Capture CUDA events for chunk/final timings.",
+    )
+    parser.add_argument(
+        "--storage",
+        choices=["auto", "cpu", "disk"],
+        default="auto",
+        help="Where to stage the streamed sequence (cpu/disk/auto).",
+    )
+    parser.add_argument(
+        "--temp-dir",
+        type=Path,
+        default=None,
+        help="Scratch directory for disk staging.",
+    )
+    parser.add_argument(
+        "--ram-limit-mb",
+        type=int,
+        default=None,
+        help="Cap host RAM usage (MB) before spilling when storage=auto.",
     )
     parser.add_argument(
         "--log-file",
@@ -122,13 +164,14 @@ def main() -> None:
     for idx, ratio in enumerate(args.ratios, start=1):
         seq_len = idx * 1_000_000
         buffer_tokens = max(1, int(seq_len * ratio))
-        chunk_len = min(args.chunk_len, MAX_FLUX_CHUNK_TOKENS)
+        chunk_len = min(args.chunk_len, MAX_SHORTLIST_CHUNK_TOKENS)
         if chunk_len < args.chunk_len and not chunk_warned:
             print(
                 f"[ShortlistSweep] Requested chunk_len={args.chunk_len:,} exceeds "
-                f"cap {MAX_FLUX_CHUNK_TOKENS:,}; using {chunk_len:,} instead."
+                f"cap {MAX_SHORTLIST_CHUNK_TOKENS:,}; using {chunk_len:,} instead."
             )
             chunk_warned = True
+        ram_limit_bytes = int(args.ram_limit_mb * 1024 * 1024) if args.ram_limit_mb else None
         cfg = ChunkedShortlistConfig(
             seq_len=seq_len,
             d_model=args.d_model,
@@ -136,14 +179,18 @@ def main() -> None:
             buffer_tokens=buffer_tokens,
             per_chunk_budget=args.per_chunk_budget,
             device=device,
-            heads=8,
-            chunk_sparse_ratio=0.05,
-            final_sparse_ratio=0.5,
+            heads=args.heads,
+            chunk_sparse_ratio=args.chunk_sparse_ratio,
+            final_sparse_ratio=args.final_sparse_ratio,
             seed=123,
             report_latency=args.report_latency and device.type == "cuda",
             progress=False,
             run_final_pass=True,
             shortlist_alpha=args.shortlist_alpha,
+            nucleus_top_p=args.nucleus_top_p,
+            storage=args.storage,
+            temp_dir=args.temp_dir,
+            ram_limit_bytes=ram_limit_bytes,
         )
         runner = ChunkedShortlistRunner(cfg)
         print(
@@ -174,6 +221,14 @@ def main() -> None:
             f"  retained={metrics.retained_tokens:,} ({metrics.retention_ratio:.4f}) "
             f"| fallback={metrics.used_fallback}"
         )
+        storage_reason = metrics.storage_reason or "host OK"
+        print(f"  storage={metrics.storage_mode} ({storage_reason})")
+        if metrics.host_required_mb is not None:
+            print(f"    host_required={metrics.host_required_mb:.1f} MB")
+        if metrics.host_allocated_mb is not None:
+            print(f"    host_allocated={metrics.host_allocated_mb:.1f} MB")
+        if metrics.host_limit_mb is not None:
+            print(f"    host_limit={metrics.host_limit_mb:.1f} MB")
 
         if log_handle is not None:
             log_handle.write(

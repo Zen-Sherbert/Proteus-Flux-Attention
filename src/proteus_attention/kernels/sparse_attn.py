@@ -1,6 +1,6 @@
 """
-Sparse attention kernels backing Genetic Attention, powered by the Dynamic
-Mixture-of-Attention-Heads (DMoAH) architecture.
+Sparse attention kernels backing Adaptive Sparse Proto Attention (ASPA),
+powered by the Dynamic Mixture-of-Attention-Heads architecture.
 
 The module exposes a Triton implementation that gathers the active query rows
 per head, runs a fused two-pass softmax with optional causal masking/dropout,
@@ -33,14 +33,14 @@ except Exception:  # pragma: no cover - optional dependency
 def _resolve_triton_seq_limit(default: int = 0) -> int:
     """Resolve the maximum sequence length for the Triton kernel."""
 
-    env_value = os.getenv("DMOAH_TRITON_SEQ_LIMIT")
+    env_value = os.getenv("ASPA_TRITON_SEQ_LIMIT")
     if env_value is None:
         return default
     try:
         parsed = int(env_value)
     except ValueError:
         warnings.warn(
-            f"Invalid DMOAH_TRITON_SEQ_LIMIT value '{env_value}', using default {default}",
+            f"Invalid ASPA_TRITON_SEQ_LIMIT value '{env_value}', using default {default}",
             RuntimeWarning,
         )
         return default
@@ -50,12 +50,12 @@ def _resolve_triton_seq_limit(default: int = 0) -> int:
 TRITON_SEQ_LEN_LIMIT = _resolve_triton_seq_limit()
 
 CUDA_BACKEND = None
-if os.getenv("DMOAH_USE_CUDA_KERNEL"):
+if os.getenv("ASPA_USE_CUDA_KERNEL"):
     try:  # pragma: no cover - optional back-end
-        from . import dmoah_cuda as CUDA_BACKEND  # type: ignore
+        from . import aspa_cuda as CUDA_BACKEND  # type: ignore
     except Exception as exc:  # noqa: BLE001
         warnings.warn(
-            f"DMoAH CUDA kernel requested but unavailable ({exc}); falling back to Triton/PyTorch",
+            f"ASPA CUDA kernel requested but unavailable ({exc}); falling back to Triton/PyTorch",
             RuntimeWarning,
         )
         CUDA_BACKEND = None
@@ -1244,7 +1244,7 @@ def _launch_triton_sparse_attention(
     shortlist_candidates: Optional[torch.Tensor],
     shortlist_lengths: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """Launch the Triton Shortlist kernel for the DMoAH sparse attention forward pass."""
+    """Launch the Triton Shortlist kernel for the ASPA sparse attention forward pass."""
 
     if not TRITON_AVAILABLE:
         raise RuntimeError("Triton runtime is not available")
@@ -1370,7 +1370,7 @@ def _launch_triton_sparse_attention(
     return out
 
 
-def dmoah_sparse_attention(
+def aspa_sparse_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1390,7 +1390,7 @@ def dmoah_sparse_attention(
     shortlist_lengths: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Reference fallback for the DMoAH sparse attention kernel.
+    Reference fallback for the ASPA sparse attention kernel.
 
     Parameters
     ----------
@@ -1509,7 +1509,7 @@ def dmoah_sparse_attention(
 
     if CUDA_BACKEND is not None and q.is_cuda and not is_quantized:
         try:  # pragma: no cover - optional path
-            out_cuda = CUDA_BACKEND.dmoah_sparse_attention(
+            out_cuda = CUDA_BACKEND.aspa_sparse_attention(
                 q,
                 k,
                 v,
@@ -1647,7 +1647,7 @@ def dmoah_sparse_attention(
 
 
 __all__ = [
-    "dmoah_sparse_attention",
+    "aspa_sparse_attention",
     "get_last_backend",
     "get_last_backend_info",
     "build_shortlist_candidates",

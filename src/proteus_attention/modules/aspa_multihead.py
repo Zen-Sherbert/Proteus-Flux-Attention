@@ -1,5 +1,4 @@
-"""Genetic Attention drop-in wrapper that mirrors ``nn.MultiheadAttention`` while
-delegating to the underlying DMoAH kernels."""
+"""Adaptive Sparse Proto Attention drop-in wrapper that mirrors ``nn.MultiheadAttention``."""
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
@@ -8,16 +7,12 @@ import torch
 import torch.nn as nn
 
 from ..kernels.sparse_attn import get_last_backend_info
-from ..models.dmoah import AdaptiveSparseProtoAttention, ModelConfig
+from ..models.aspa import AdaptiveSparseProtoAttention, ModelConfig
 from .sparse_ctl import SparseHeadController, SparseCtlSnapshot
 
 
-class CausalGeneticMultiheadAttention(nn.Module):
-    """
-    Thin adapter that exposes Genetic Attention via :class:`AdaptiveSparseProtoAttention`
-    using the familiar ``nn.MultiheadAttention`` API (restricted to causal
-    self-attention for now).
-    """
+class CausalASPAMultiheadAttention(nn.Module):
+    """Thin adapter that exposes ASPA via :class:`AdaptiveSparseProtoAttention`."""
 
     def __init__(
         self,
@@ -54,7 +49,7 @@ class CausalGeneticMultiheadAttention(nn.Module):
             "attn_h_active_max": config_overrides.pop("attn_h_active_max", self.num_heads),
             "p_dropout": float(dropout),
             "bias": bool(bias),
-            "attn_variant": "dmoah",
+            "attn_variant": "aspa",
             "attn_mode": config_overrides.pop("attn_mode", "auto"),
             "attn_proto_enable": bool(config_overrides.pop("attn_proto_enable", True)),
             "n_ctx": int(max_seq_len or config_overrides.pop("n_ctx", 0)),
@@ -254,3 +249,4 @@ class CausalGeneticMultiheadAttention(nn.Module):
     def sparse_controller(self) -> Optional[SparseHeadController]:
         """Expose the optional sparse head controller."""
         return self._sparse_ctl
+__all__ = ["CausalASPAMultiheadAttention"]

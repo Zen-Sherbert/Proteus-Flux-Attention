@@ -9,7 +9,8 @@ keep indices remain monotonic (mirroring the RoPE position story).
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, asdict
 import sys
 from pathlib import Path
 from typing import Iterable, List, Tuple, Sequence, Union, Optional
@@ -26,9 +27,13 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from proteus_attention.tools.chunked_shortlist import (
+    ChunkedShortlistConfig,
+    ChunkedShortlistRunner,
+    MAX_SHORTLIST_CHUNK_TOKENS,
     _chunk_iter,
     _finalise_indices,
     _select_top_tokens,
+    _nucleus_select,
 )
 
 
@@ -50,6 +55,101 @@ class _MockModel:
         self._last_token_mask: torch.Tensor | None = None
 
 
+def _select_top_tokens_cpu(
+    importance: Optional[torch.Tensor],
+    mask: Optional[torch.Tensor],
+    global_offset: int,
+    *,
+    per_chunk_budget: int,
+    nucleus_top_p: float,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    if importance is None:
+        return None
+    scores = importance.squeeze(0).to(torch.float32)
+    if mask is not None:
+        scores = torch.where(
+            mask.squeeze(0).to(torch.bool),
+            scores,
+            torch.full_like(scores, float("-inf")),
+        )
+    selection = _nucleus_select(scores, per_chunk_budget, nucleus_top_p)
+    if selection is None:
+        return None
+    values, indices = selection
+    finite_mask = torch.isfinite(values)
+    if not torch.any(finite_mask):
+        return None
+    values = values[finite_mask]
+    indices = indices[finite_mask] + int(global_offset)
+    return values, indices
+
+
+def _resolve_device(choice: Optional[str]) -> torch.device:
+    if choice is None or str(choice).lower() == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():  # pragma: no cover
+            return torch.device("mps")
+        return torch.device("cpu")
+    return torch.device(choice)
+
+
+def _fmt_ms(value: Optional[float]) -> str:
+    return "-" if value is None else f"{value:7.1f}"
+
+
+def _fmt_rate(value: Optional[float]) -> str:
+    if value is None:
+        return "-"
+    if value >= 1e6:
+        return f"{value/1e6:.2f}M"
+    if value >= 1e3:
+        return f"{value/1e3:.2f}k"
+    return f"{value:.0f}"
+
+
+def _fmt_percent(value: Optional[float]) -> str:
+    return "-" if value is None else f"{value*100.0:6.2f}%"
+
+
+def _fmt_mem(value: Optional[float]) -> str:
+    return "-" if value is None else f"{value:7.1f}"
+
+
+def _sentinel_positions(seq_len: int, count: int) -> List[int]:
+    count = max(1, count)
+    step = seq_len / float(count + 1)
+    slots: List[int] = []
+    for idx in range(count):
+        pos = int(round(step * (idx + 1)))
+        pos = max(0, min(seq_len - 1, pos))
+        if slots and pos <= slots[-1]:
+            pos = min(seq_len - 1, slots[-1] + 1)
+        slots.append(pos)
+    return slots
+
+
+def _build_demo_sequence(
+    seq_len: int,
+    d_model: int,
+    sentinels: Sequence[int],
+    boost: float,
+    width: int,
+    seed: Optional[int],
+) -> torch.Tensor:
+    width = max(1, min(width, d_model))
+    generator = torch.Generator(device="cpu")
+    if seed is not None:
+        generator.manual_seed(int(seed))
+    base = torch.randn(1, seq_len, d_model, generator=generator, dtype=torch.float32)
+    for idx in sentinels:
+        if 0 <= idx < seq_len:
+            base[0, idx, :width] += boost
+            if width < d_model:
+                base[0, idx, width:] -= boost * 0.15
+    return base
+
+
 def _run_pipeline(
     *,
     seq_len: int,
@@ -63,6 +163,7 @@ def _run_pipeline(
     rng_seed: int = 123,
     adaptive_margin: Optional[float] = None,
     max_chunk_extra: int = 8,
+    nucleus_top_p: float = 0.9,
 ) -> Tuple[torch.Tensor, List[ChunkLog]]:
     """Execute the chunking helpers with synthetic importance scores."""
 
@@ -112,7 +213,16 @@ def _run_pipeline(
             model,
             start,
             per_chunk_budget=budget_this_chunk,
+            nucleus_top_p=nucleus_top_p,
         )
+        if promoted is None:
+            promoted = _select_top_tokens_cpu(
+                model._last_token_importance,
+                model._last_token_mask,
+                start,
+                per_chunk_budget=budget_this_chunk,
+                nucleus_top_p=nucleus_top_p,
+            )
         if promoted is None:
             continue
         scores_tensor, indices_tensor = promoted
@@ -239,6 +349,7 @@ def _sample_text_demo(args: argparse.Namespace) -> None:
         sentinel_idx=sentinel_indices,
         base_boost=5.0,
         proto_boost=1.0,
+        nucleus_top_p=args.nucleus_top_p,
     )
     keep_indices = keep_indices.to(torch.long)
     retained_flags = {
@@ -268,6 +379,7 @@ def _needle_cluster_test(args: argparse.Namespace) -> None:
         sentinel_idx=sentinels,
         base_boost=3.0,
         proto_boost=0.0,
+        nucleus_top_p=args.nucleus_top_p,
     )
     retained = sum(bool((keep_indices == idx).any()) for idx in sentinels)
     recall = retained / len(sentinels)
@@ -289,6 +401,7 @@ def _needle_cluster_test(args: argparse.Namespace) -> None:
             proto_boost=0.0,
             adaptive_margin=adaptive_margin,
             max_chunk_extra=args.cluster_max_extra,
+            nucleus_top_p=args.nucleus_top_p,
         )
         retained_adapt = sum(bool((keep_indices_adapt == idx).any()) for idx in sentinels)
         recall_adapt = retained_adapt / len(sentinels)
@@ -318,6 +431,7 @@ def _fading_signal_test(
                 base_boost=boost,
                 proto_boost=0.0,
                 rng_seed=seed,
+                nucleus_top_p=args.nucleus_top_p,
             )
             if bool((keep_indices == sentinel_idx).any()):
                 hits += 1
@@ -338,6 +452,7 @@ def _jigsaw_puzzle_test(args: argparse.Namespace) -> None:
         sentinel_idx=sentinels,
         base_boost=4.0,
         proto_boost=0.5,
+        nucleus_top_p=args.nucleus_top_p,
     )
     both = all(bool((keep_indices == idx).any()) for idx in sentinels)
     print(f"[jigsaw] both clues retained? {both} | keep_indices={keep_indices.tolist()}")
@@ -387,7 +502,16 @@ def _live_fire_test(args: argparse.Namespace) -> None:
             model_stub,
             start,
             per_chunk_budget=args.per_chunk_budget,
+            nucleus_top_p=args.nucleus_top_p,
         )
+        if promoted is None:
+            promoted = _select_top_tokens_cpu(
+                model_stub._last_token_importance,
+                model_stub._last_token_mask,
+                start,
+                per_chunk_budget=args.per_chunk_budget,
+                nucleus_top_p=args.nucleus_top_p,
+            )
         if promoted is None:
             continue
         scores_tensor, indices_tensor = promoted
@@ -406,6 +530,152 @@ def _live_fire_test(args: argparse.Namespace) -> None:
     retained_tokens = [tokens[idx] for idx in keep_indices.tolist()]
     print(f"[live-fire] retained {len(retained_tokens)} tokens:")
     print("  " + " ".join(retained_tokens))
+
+
+def _runner_showcase(args: argparse.Namespace) -> None:
+    if not args.runner_demo:
+        return
+
+    try:
+        device = _resolve_device(args.demo_device)
+    except (RuntimeError, ValueError) as exc:  # pragma: no cover - invalid device
+        print(f"[runner-demo] Unable to resolve device '{args.demo_device}': {exc}")
+        return
+
+    seq_len = int(args.demo_seq_len or args.seq_len)
+    d_model = int(args.demo_d_model or args.d_model)
+    chunk_len = min(int(args.chunk_len), seq_len)
+    if chunk_len > MAX_SHORTLIST_CHUNK_TOKENS:
+        print(
+            f"[runner-demo] chunk_len {chunk_len:,} exceeds MAX_SHORTLIST_CHUNK_TOKENS "
+            f"({MAX_SHORTLIST_CHUNK_TOKENS:,}); using the cap."
+        )
+        chunk_len = MAX_SHORTLIST_CHUNK_TOKENS
+
+    buffer_tokens = max(
+        args.buffer_tokens,
+        int(seq_len * float(args.demo_buffer_ratio)),
+    )
+    per_chunk_budget = max(args.per_chunk_budget, args.demo_per_chunk_budget)
+    sentinels = _sentinel_positions(seq_len, args.demo_sentinel_count)
+    base_sequence = _build_demo_sequence(
+        seq_len=seq_len,
+        d_model=d_model,
+        sentinels=sentinels,
+        boost=args.demo_signal_boost,
+        width=args.demo_signal_width,
+        seed=args.demo_seed,
+    )
+
+    alphas = args.demo_alphas or [0.0, 0.35, 1.0]
+    results: List[dict] = []
+    ram_limit = int(args.demo_ram_limit_mb * 1024 * 1024) if args.demo_ram_limit_mb else None
+
+    print(
+        f"[runner-demo] seq_len={seq_len:,} chunk_len={chunk_len:,} buffer={buffer_tokens:,} "
+        f"per_chunk_budget={per_chunk_budget:,} heads={args.demo_heads} device={device} "
+        f"sentinels={sentinels}"
+    )
+
+    for alpha in alphas:
+        cfg = ChunkedShortlistConfig(
+            seq_len=seq_len,
+            d_model=d_model,
+            chunk_len=chunk_len,
+            buffer_tokens=buffer_tokens,
+            per_chunk_budget=per_chunk_budget,
+            device=device,
+            heads=args.demo_heads,
+            nucleus_top_p=args.nucleus_top_p,
+            chunk_sparse_ratio=args.demo_chunk_sparse_ratio,
+            final_sparse_ratio=args.demo_final_sparse_ratio,
+            seed=args.demo_seed,
+            report_latency=args.demo_report_latency,
+            progress=args.demo_progress,
+            run_final_pass=not args.demo_skip_final,
+            shortlist_alpha=float(alpha),
+            storage=args.demo_storage,
+            temp_dir=args.demo_temp_dir,
+            ram_limit_bytes=ram_limit,
+        )
+        runner = ChunkedShortlistRunner(cfg)
+        try:
+            outcome = runner.run(sequence=base_sequence.clone())
+        except RuntimeError as exc:  # pragma: no cover - device/runtime issues
+            print(f"[runner-demo] alpha={alpha:.3f} failed: {exc}")
+            continue
+
+        metrics = outcome.metrics
+        keep_indices = outcome.keep_indices.detach().cpu()
+        hits = sum(int((keep_indices == idx).any().item()) for idx in sentinels)
+        recall = hits / len(sentinels)
+        entry = {
+            "alpha": float(alpha),
+            "metrics": metrics,
+            "sentinel_hits": hits,
+            "sentinel_recall": recall,
+            "backend": outcome.backend_info,
+            "storage_reason": metrics.storage_reason,
+        }
+        results.append(entry)
+
+    if not results:
+        print("[runner-demo] No successful runs recorded.")
+        return
+
+    header = (
+        f"{'alpha':>7} {'retain':>10} {'ratio':>8} "
+        f"{'chunk':>9} {'final':>9} {'total':>9} {'tok/s':>9} {'VRAM':>9} {'sentinel':>10}"
+    )
+    print("\n" + header)
+    print("-" * len(header))
+    for row in results:
+        metrics = row["metrics"]
+        sentinel_pct = f"{row['sentinel_recall']*100.0:6.2f}%"
+        print(
+            f"{row['alpha']:7.3f} "
+            f"{metrics.retained_tokens:10d} "
+            f"{metrics.retention_ratio:8.4f} "
+            f"{_fmt_ms(metrics.chunk_time_ms):>9} "
+            f"{_fmt_ms(metrics.final_time_ms):>9} "
+            f"{_fmt_ms(metrics.total_time_ms):>9} "
+            f"{_fmt_rate(metrics.total_tokens_per_s):>9} "
+            f"{_fmt_mem(metrics.peak_memory_mb):>9} "
+            f"{sentinel_pct:>10}"
+        )
+    print(f"\n[runner-demo] storage={results[-1]['metrics'].storage_mode}")
+    if results[-1]["storage_reason"]:
+        print(f"[runner-demo] storage reason: {results[-1]['storage_reason']}")
+    backend = results[-1].get("backend")
+    if backend:
+        print(f"[runner-demo] backend: {backend}")
+
+    if args.demo_report is not None:
+        payload = {
+            "config": {
+                "seq_len": seq_len,
+                "d_model": d_model,
+                "chunk_len": chunk_len,
+                "buffer_tokens": buffer_tokens,
+                "per_chunk_budget": per_chunk_budget,
+                "device": str(device),
+                "sentinels": sentinels,
+            },
+            "results": [
+                {
+                    "alpha": row["alpha"],
+                    "sentinel_hits": row["sentinel_hits"],
+                    "sentinel_recall": row["sentinel_recall"],
+                    "metrics": asdict(row["metrics"]),
+                    "backend": row["backend"],
+                    "storage_reason": row["storage_reason"],
+                }
+                for row in results
+            ],
+        }
+        args.demo_report.parent.mkdir(parents=True, exist_ok=True)
+        args.demo_report.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"[runner-demo] Saved report to {args.demo_report}")
 
 
 def run_checks(args: argparse.Namespace) -> None:
@@ -429,6 +699,7 @@ def run_checks(args: argparse.Namespace) -> None:
         sentinel_idx=sentinel_idx,
         base_boost=5.0,
         proto_boost=0.0,
+        nucleus_top_p=args.nucleus_top_p,
     )
     if args.verbose:
         print(_format_logs(logs))
@@ -445,6 +716,7 @@ def run_checks(args: argparse.Namespace) -> None:
         sentinel_idx=sentinel_idx,
         base_boost=-0.2,
         proto_boost=0.0,
+        nucleus_top_p=args.nucleus_top_p,
     )
     keep_with_proto, logs_with_proto = _run_pipeline(
         seq_len=seq_len,
@@ -455,6 +727,7 @@ def run_checks(args: argparse.Namespace) -> None:
         sentinel_idx=sentinel_idx,
         base_boost=-0.2,
         proto_boost=1.0,
+        nucleus_top_p=args.nucleus_top_p,
     )
     if args.verbose:
         print("-- without Proto boost --")
@@ -500,7 +773,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--buffer-tokens", type=int, default=8)
     parser.add_argument("--per-chunk-budget", type=int, default=2)
     parser.add_argument("--sentinel-index", type=int, default=5231)
+    parser.add_argument(
+        "--nucleus-top-p",
+        type=float,
+        default=0.9,
+        help="Top-p (nucleus) filter threshold when selecting chunk tokens.",
+    )
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--skip-synthetic",
+        action="store_true",
+        help="Skip the synthetic unit tests and only run the showcase demos.",
+    )
     parser.add_argument(
         "--fading-boosts",
         type=float,
@@ -577,24 +861,138 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="Maximum additional tokens a bursty chunk may promote in the cluster test.",
     )
+    parser.add_argument(
+        "--runner-demo",
+        action="store_true",
+        help="Run a full ChunkedShortlistRunner demo using synthetic embeddings.",
+    )
+    parser.add_argument("--demo-device", default="auto", help="Device used for the runner demo (default: auto).")
+    parser.add_argument("--demo-seq-len", type=int, default=262_144, help="Sequence length for the runner demo.")
+    parser.add_argument("--demo-d-model", type=int, default=None, help="Override d_model for the runner demo.")
+    parser.add_argument(
+        "--demo-heads",
+        type=int,
+        default=8,
+        help="Attention heads used by the runner demo.",
+    )
+    parser.add_argument(
+        "--demo-buffer-ratio",
+        type=float,
+        default=0.02,
+        help="Buffer ratio (fraction of seq_len) retained during the runner demo.",
+    )
+    parser.add_argument(
+        "--demo-per-chunk-budget",
+        type=int,
+        default=4_096,
+        help="Per-chunk shortlist budget for the runner demo.",
+    )
+    parser.add_argument(
+        "--demo-sentinel-count",
+        type=int,
+        default=4,
+        help="Number of synthetic sentinel positions injected into the runner demo.",
+    )
+    parser.add_argument(
+        "--demo-signal-boost",
+        type=float,
+        default=6.0,
+        help="Magnitude added to sentinel token embeddings in the runner demo.",
+    )
+    parser.add_argument(
+        "--demo-signal-width",
+        type=int,
+        default=16,
+        help="Embedding width influenced by the sentinel boost.",
+    )
+    parser.add_argument(
+        "--demo-seed",
+        type=int,
+        default=123,
+        help="Random seed for the runner demo synthetic embeddings.",
+    )
+    parser.add_argument(
+        "--demo-chunk-sparse-ratio",
+        type=float,
+        default=0.05,
+        help="Chunk-stage sparsity ratio for the runner demo.",
+    )
+    parser.add_argument(
+        "--demo-final-sparse-ratio",
+        type=float,
+        default=0.5,
+        help="Final-pass sparsity ratio for the runner demo.",
+    )
+    parser.add_argument(
+        "--demo-alphas",
+        type=float,
+        nargs="+",
+        default=[0.0, 0.35, 1.0],
+        help="Shortlist alpha settings swept during the runner demo.",
+    )
+    parser.add_argument(
+        "--demo-progress",
+        action="store_true",
+        help="Enable tqdm progress bars during the runner demo.",
+    )
+    parser.add_argument(
+        "--demo-report-latency",
+        action="store_true",
+        help="Capture CUDA event timings during the runner demo.",
+    )
+    parser.add_argument(
+        "--demo-skip-final",
+        action="store_true",
+        help="Skip the final attention pass in the runner demo.",
+    )
+    parser.add_argument(
+        "--demo-storage",
+        choices=["auto", "cpu", "disk"],
+        default="auto",
+        help="Staging location for the runner demo sequence.",
+    )
+    parser.add_argument(
+        "--demo-temp-dir",
+        type=Path,
+        default=None,
+        help="Scratch directory for disk-backed runner demo staging.",
+    )
+    parser.add_argument(
+        "--demo-ram-limit-mb",
+        type=int,
+        default=None,
+        help="RAM limit (MB) before spilling runner demo data to disk.",
+    )
+    parser.add_argument(
+        "--demo-report",
+        type=Path,
+        default=None,
+        help="Optional JSON file summarising runner demo metrics.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    keep_params = args.chunk_len * args.buffer_tokens / max(args.seq_len, 1)
-    print(
-        f"config: seq_len={args.seq_len:,} chunk_len={args.chunk_len:,} "
-        f"buffer_tokens={args.buffer_tokens:,} per_chunk_budget={args.per_chunk_budget:,} "
-        f"(keep ratio {keep_params:.3f})"
-    )
-    run_checks(args)
+    if not args.skip_synthetic:
+        keep_params = args.chunk_len * args.buffer_tokens / max(args.seq_len, 1)
+        print(
+            f"config: seq_len={args.seq_len:,} chunk_len={args.chunk_len:,} "
+            f"buffer_tokens={args.buffer_tokens:,} per_chunk_budget={args.per_chunk_budget:,} "
+            f"(keep ratio {keep_params:.3f})"
+        )
+        run_checks(args)
+    else:
+        print("[info] Skipping synthetic shortlist unit tests (--skip-synthetic).")
     if args.sample_file is not None or (args.sample_text and args.sample_text.strip()):
         print("\n=== Sample text demo ===")
         _sample_text_demo(args)
     if args.enable_live_fire:
         print("\n=== Live fire integration ===")
         _live_fire_test(args)
+    if args.runner_demo:
+        print("\n=== Chunked Shortlist runner showcase ===")
+        _runner_showcase(args)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Sliding-context training run for DMoAH.
+Sliding-context training run for ASPA.
 
 The run progresses through short, mid, and long context windows so we can
 evaluate how the model adapts as the receptive field expands.
@@ -19,14 +19,14 @@ from typing import Iterator, List, Tuple
 import torch
 import torch.nn.functional as F
 
-from proteus_attention.examples.dmoah_train import (  # type: ignore[attr-defined]
+from proteus_attention.examples.aspa_train import (  # type: ignore[attr-defined]
     CharTokenizer,
     SimpleGPT,
     get_device,
     set_reproducible,
 )
 from proteus_attention.kernels.sparse_attn import get_last_backend_info
-from proteus_attention.models.dmoah import ModelConfig
+from proteus_attention.models.aspa import ModelConfig
 
 
 def _load_corpus(path: Path, limit: int | None = None) -> str:
@@ -204,7 +204,7 @@ def train_schedule(
 
 def parse_args() -> argparse.Namespace:
     default_dataset = Path(__file__).resolve().parent / "samples" / "shortlist_sample.txt"
-    parser = argparse.ArgumentParser(description="Sliding-context DMoAH training run.")
+    parser = argparse.ArgumentParser(description="Sliding-context ASPA training run.")
     parser.add_argument(
         "--dataset",
         type=Path,
@@ -289,7 +289,7 @@ def main() -> None:
     )
     config.block_size = long_ctx
 
-    model = SimpleGPT(config, model_type="dmoah")
+    model = SimpleGPT(config, model_type="aspa")
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )

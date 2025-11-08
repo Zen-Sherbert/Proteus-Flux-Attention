@@ -10,9 +10,9 @@ import proteus_attention.kernels.sparse_attn as sparse_attn
 from proteus_attention.kernels.sparse_attn import (
     build_shortlist_candidates,
     build_packed_shortlist_candidates,
-    dmoah_sparse_attention,
+    aspa_sparse_attention,
 )
-from proteus_attention.models.dmoah import (
+from proteus_attention.models.aspa import (
     AdaptiveSparseAttentionBlock,
     AdaptiveSparseAttention,
     ModelConfig,
@@ -166,11 +166,11 @@ class GPT(nn.Module):
         self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
         self.pos_emb = nn.Embedding(config.n_ctx, config.d_model)
         attn_variant = str(getattr(config, "attn_variant", "standard")).lower()
-        self.use_dmoah = attn_variant == "dmoah"
+        self.use_aspa = attn_variant == "aspa"
 
         blocks = []
         for _ in range(config.n_layer):
-            if self.use_dmoah:
+            if self.use_aspa:
                 blocks.append(AdaptiveSparseAttentionBlock(config))
             else:
                 blocks.append(StandardAdaptiveSparseAttentionBlock(config))
@@ -189,7 +189,7 @@ class GPT(nn.Module):
         attn_stats: list[dict] = []
         for block in self.blocks:
             x = block(x)
-            if self.use_dmoah:
+            if self.use_aspa:
                 stats = getattr(block, "last_head_stats", None)
                 if stats is not None:
                     attn_stats.append(stats)
@@ -207,7 +207,7 @@ class GPT(nn.Module):
             )
         return logits, loss
 
-def test_dmoah_sparse_attention_matches_manual_reference():
+def test_aspa_sparse_attention_matches_manual_reference():
     torch.manual_seed(0)
     batch_heads, tokens, head_dim = 5, 7, 8
     q = torch.randn(batch_heads, tokens, head_dim)
@@ -222,7 +222,7 @@ def test_dmoah_sparse_attention_matches_manual_reference():
         active_mask[head, mask, 0] = 1.0
     causal_mask = torch.triu(torch.full((tokens, tokens), float("-inf"), dtype=q.dtype), diagonal=1)
 
-    out_sparse = dmoah_sparse_attention(
+    out_sparse = aspa_sparse_attention(
         q,
         k,
         v,
@@ -248,7 +248,7 @@ def test_dmoah_sparse_attention_matches_manual_reference():
 
 
 @pytest.mark.parametrize("percentile", [1.0, 0.999])
-def test_dmoah_sparse_attention_quantized_int8_close_to_fp(percentile):
+def test_aspa_sparse_attention_quantized_int8_close_to_fp(percentile):
     torch.manual_seed(42)
     batch_heads, tokens, head_dim = 4, 10, 16
     q = torch.randn(batch_heads, tokens, head_dim, dtype=torch.float32)
@@ -279,7 +279,7 @@ def test_dmoah_sparse_attention_quantized_int8_close_to_fp(percentile):
     k_int8, k_scales = quantize_per_head(k)
     v_int8, v_scales = quantize_per_head(v)
 
-    out_float = dmoah_sparse_attention(
+    out_float = aspa_sparse_attention(
         q,
         k,
         v,
@@ -287,7 +287,7 @@ def test_dmoah_sparse_attention_quantized_int8_close_to_fp(percentile):
         causal_mask=causal_mask,
         training=False,
     )
-    out_quant = dmoah_sparse_attention(
+    out_quant = aspa_sparse_attention(
         q_int8,
         k_int8,
         v_int8,
@@ -424,7 +424,7 @@ def test_build_packed_shortlist_candidates_matches_per_head(use_proto: bool) -> 
     assert torch.equal(packed_lengths, baseline_lengths)
 
 
-def test_dmoah_sparse_attention_matches_sdpa_without_mask():
+def test_aspa_sparse_attention_matches_sdpa_without_mask():
     torch.manual_seed(1)
     batch_heads, tokens, head_dim = 3, 6, 5
     q = torch.randn(batch_heads, tokens, head_dim)
@@ -432,7 +432,7 @@ def test_dmoah_sparse_attention_matches_sdpa_without_mask():
     v = torch.randn_like(q)
     causal_mask = torch.triu(torch.full((tokens, tokens), float("-inf"), dtype=q.dtype), diagonal=1)
 
-    out_sparse = dmoah_sparse_attention(
+    out_sparse = aspa_sparse_attention(
         q,
         k,
         v,
@@ -461,7 +461,7 @@ def test_causal_dynamic_attention_linear_matches_dense_when_full_window():
         d_model=64,
         p_dropout=0.0,
         bias=False,
-        attn_variant="dmoah",
+        attn_variant="aspa",
         attn_h_total=4,
         attn_h_active=4,
         attn_h_active_min=4,
@@ -521,7 +521,7 @@ def test_causal_dynamic_attention_linear_policy_variants(policy, anchor_stride, 
         d_model=64,
         p_dropout=0.0,
         bias=False,
-        attn_variant="dmoah",
+        attn_variant="aspa",
         attn_h_total=4,
         attn_h_active=4,
         attn_h_active_min=4,
@@ -585,7 +585,7 @@ def test_causal_dynamic_attention_latency_budget_auto_switch():
         d_model=32,
         p_dropout=0.0,
         bias=False,
-        attn_variant="dmoah",
+        attn_variant="aspa",
         attn_h_total=4,
         attn_h_active=4,
         attn_h_active_min=2,
@@ -606,7 +606,7 @@ def test_causal_dynamic_attention_latency_budget_auto_switch():
     assert pytest.approx(alpha_low, rel=0.0, abs=1e-6) == 0.0
 
 
-def test_gpt_dmoah_matches_dense_when_all_heads_active():
+def test_gpt_aspa_matches_dense_when_all_heads_active():
     torch.manual_seed(321)
     cfg_dense = ModelConfig(
         vocab_size=48,
@@ -629,7 +629,7 @@ def test_gpt_dmoah_matches_dense_when_all_heads_active():
         d_model=64,
         p_dropout=0.0,
         bias=False,
-        attn_variant="dmoah",
+        attn_variant="aspa",
         attn_h_total=4,
         attn_h_active=4,
         attn_gates=8,
@@ -677,7 +677,7 @@ def test_causal_dynamic_attention_quantized_path_matches_fp(mode, percentile):
         d_model=64,
         p_dropout=0.0,
         bias=False,
-        attn_variant="dmoah",
+        attn_variant="aspa",
         attn_h_total=8,
         attn_h_active=4,
         attn_h_active_min=2,
@@ -715,7 +715,7 @@ def test_causal_dynamic_attention_quantized_path_matches_fp(mode, percentile):
     assert diff.max() < 0.2
 
 
-def test_dmoah_active_head_schedule_respects_min_max_bounds():
+def test_aspa_active_head_schedule_respects_min_max_bounds():
     cfg = ModelConfig(
         vocab_size=32,
         n_ctx=4096,
@@ -724,7 +724,7 @@ def test_dmoah_active_head_schedule_respects_min_max_bounds():
         d_model=64,
         p_dropout=0.0,
         bias=False,
-        attn_variant="dmoah",
+        attn_variant="aspa",
         attn_h_total=32,
         attn_h_active=8,
         attn_h_active_min=2,
@@ -747,17 +747,17 @@ def test_dmoah_active_head_schedule_respects_min_max_bounds():
     assert samples == sorted(samples, reverse=True)
 
 
-def test_cli_preset_dmoah_sets_variant():
+def test_cli_preset_aspa_sets_variant():
     if _prepare_training_configs is None:
         pytest.skip("Typer/CLI dependencies not available")
-    mc, _tc, _oc, _dc = _prepare_training_configs(preset="dmoah", config_files=None, overrides=None)
-    assert mc.attn_variant == "dmoah"
+    mc, _tc, _oc, _dc = _prepare_training_configs(preset="aspa", config_files=None, overrides=None)
+    assert mc.attn_variant == "aspa"
     assert mc.attn_h_total > 0
     assert 0 < mc.attn_h_active <= mc.attn_h_total
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP device is required for Triton path test")
-def test_dmoah_sparse_attention_triton_gpu_matches_cpu():
+def test_aspa_sparse_attention_triton_gpu_matches_cpu():
     if not getattr(sparse_attn, "TRITON_AVAILABLE", False):
         pytest.skip("Triton runtime not available")
 
@@ -789,7 +789,7 @@ def test_dmoah_sparse_attention_triton_gpu_matches_cpu():
         shortlist_lengths=None,
     )
 
-    out_gpu = dmoah_sparse_attention(
+    out_gpu = aspa_sparse_attention(
         q,
         k,
         v,
@@ -799,7 +799,7 @@ def test_dmoah_sparse_attention_triton_gpu_matches_cpu():
         training=False,
     ).cpu()
 
-    out_cpu = dmoah_sparse_attention(
+    out_cpu = aspa_sparse_attention(
         q.cpu(),
         k.cpu(),
         v.cpu(),

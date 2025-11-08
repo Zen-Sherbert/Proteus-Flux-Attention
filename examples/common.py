@@ -97,14 +97,14 @@ class EMA:
                 shadow_param = self.shadow.get(name)
                 if shadow_param is None:
                     continue
-                backups[name] = param.detach().clone()
+                backups[name] = param.detach().to("cpu", copy=True)
                 param.data.copy_(shadow_param)
             yield
         finally:
             for name, param in model.named_parameters():
                 backup = backups.get(name)
                 if backup is not None:
-                    param.data.copy_(backup)
+                    param.data.copy_(backup.to(device=param.device, dtype=param.dtype))
 
 
 def load_corpus(path: Optional[Path] = None, *, max_chars: int = 64 * 1024 * 1024) -> str:

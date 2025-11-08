@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from proteus_attention.models.dmoah import AdaptiveSparseAttention
+from proteus_attention.models.aspa import AdaptiveSparseAttention
 from proteus_attention.kernels.sparse_attn import get_last_backend_info
 from proteus_attention.tools.chunked_shortlist import ChunkedShortlistConfig, ChunkedShortlistRunner
 
@@ -271,7 +271,7 @@ def _maybe_generate_plot(
     return target_path
 
 
-def build_dmoah_config(
+def build_aspa_config(
     seq_len: int,
     seq_high: int,
     *,
@@ -450,7 +450,7 @@ def _apply_memory_saving_overrides(config: SimpleNamespace, seq_len: int) -> Sim
     return config
 
 
-def _prepare_dmoah_config(
+def _prepare_aspa_config(
     seq_len: int,
     seq_high: int,
     *,
@@ -459,7 +459,7 @@ def _prepare_dmoah_config(
     memory_guard: bool,
     allow_sdpa_fastpath: bool,
 ) -> SimpleNamespace:
-    config = build_dmoah_config(
+    config = build_aspa_config(
         seq_len,
         seq_high,
         d_model=d_model,
@@ -521,7 +521,7 @@ def _parse_mode_label(value: object) -> tuple[str, Optional[float]]:
     return mode or "-", alpha
 
 
-def _instantiate_dmoah_model(
+def _instantiate_aspa_model(
     seq_len: int,
     seq_high: int,
     *,
@@ -533,7 +533,7 @@ def _instantiate_dmoah_model(
 ) -> tuple[AdaptiveSparseAttention, SimpleNamespace, float | None]:
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    config = _prepare_dmoah_config(
+    config = _prepare_aspa_config(
         seq_len,
         seq_high,
         d_model=d_model,
@@ -580,7 +580,7 @@ def _prime_linear_mode(
     if key in _LINEAR_WARM_STATE:
         return
     prime_len = min(2048, max(1024, seq_target))
-    config = _prepare_dmoah_config(
+    config = _prepare_aspa_config(
         prime_len,
         max(seq_high, prime_len),
         d_model=d_model,
@@ -629,7 +629,7 @@ def _prewarm_shortlist_kernels(
                 device=device,
                 dtype=torch.get_default_dtype(),
             )
-            config = _prepare_dmoah_config(
+            config = _prepare_aspa_config(
                 seq_len,
                 seq_high,
                 d_model=d_model,
@@ -788,7 +788,7 @@ class StandardAttention(nn.Module):
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark DMoAH (Dynamic Mixture-of-Attention-Heads) kernels vs. standard attention."
+        description="Benchmark ASPA (Dynamic Mixture-of-Attention-Heads) kernels vs. standard attention."
     )
     parser.add_argument(
         "--device", choices=["auto", "cpu", "cuda"], default="auto", help="Force device selection.")
@@ -1017,7 +1017,7 @@ def main(argv: list[str] | None = None) -> None:
     safe_chunked_shortlist = None
     if device.type == 'cuda' and probe_lengths:
         safe_std = None
-        safe_dmoah = None
+        safe_aspa = None
         if not args.disable_standard:
             safe_std = estimate_safe_length(
                 label="Standard",
@@ -1028,7 +1028,7 @@ def main(argv: list[str] | None = None) -> None:
             )
 
         def _factory(seq: int) -> AdaptiveSparseAttention:
-            model, _, _ = _instantiate_dmoah_model(
+            model, _, _ = _instantiate_aspa_model(
                 seq,
                 seq_high,
                 d_model=D_MODEL,
@@ -1039,8 +1039,8 @@ def main(argv: list[str] | None = None) -> None:
             )
             return model
 
-        safe_dmoah = estimate_safe_length(
-            label="DMoAH",
+        safe_aspa = estimate_safe_length(
+            label="ASPA",
             sequence_lengths=probe_lengths,
             batch_size=BASE_BATCH_SIZE,
             d_model=D_MODEL,
@@ -1056,7 +1056,7 @@ def main(argv: list[str] | None = None) -> None:
             )
     else:
         safe_std = max(sequence_lengths) if not args.disable_standard else None
-        safe_dmoah = max(sequence_lengths)
+        safe_aspa = max(sequence_lengths)
         if chunked_shortlist_enabled:
             safe_chunked_shortlist = max(sequence_lengths)
 
@@ -1078,8 +1078,8 @@ def main(argv: list[str] | None = None) -> None:
     dtype_label = "BF16" if use_bf16 else "FP32"
     dtype_key = "bf16" if use_bf16 else "fp32"
     variant_configs = [
-        (f"DMoAH ({dtype_label})", False, dtype_key),
-        ("DMoAH (INT8)", True, "int8"),
+        (f"ASPA ({dtype_label})", False, dtype_key),
+        ("ASPA (INT8)", True, "int8"),
     ]
     if args.disable_int8:
         variant_configs = [entry for entry in variant_configs if not entry[1]]
@@ -1109,7 +1109,7 @@ def main(argv: list[str] | None = None) -> None:
             memory_guard=args.memory_guard,
             allow_sdpa_fastpath=allow_sdpa_fastpath,
         )
-    dmoah_limit_announced = {key: False for _, _, key in variant_configs}
+    aspa_limit_announced = {key: False for _, _, key in variant_configs}
     variant_active = {key: True for _, _, key in variant_configs}
     variant_last_success = {key: None for _, _, key in variant_configs}
     chunked_shortlist_active = True
@@ -1206,10 +1206,10 @@ def main(argv: list[str] | None = None) -> None:
         variant_status_map: dict[str, str] = {}
         for variant_label, quantize, variant_key in variant_configs:
             run_variant = variant_active[variant_key] and (
-                safe_dmoah is None or seq_len <= safe_dmoah or device.type != 'cuda')
+                safe_aspa is None or seq_len <= safe_aspa or device.type != 'cuda')
             record = {
                 "seq_len": seq_len,
-                "model": f"dmoah_{variant_key}",
+                "model": f"aspa_{variant_key}",
                 "variant": variant_label,
                 "quantized": quantize,
                 "batch_size": batch_eff,
@@ -1225,14 +1225,14 @@ def main(argv: list[str] | None = None) -> None:
             throughput = None
             mem_use = None
             status = "skipped"
-            backend_display = "dmoah-skip"
+            backend_display = "aspa-skip"
             active_k_display = "-"
             token_keep_display = "-"
             alpha_display = "-"
             mode_display = "-"
             alpha_value: float | None = None
             if run_variant:
-                model_dmoah, config_dmoah, alpha_override = _instantiate_dmoah_model(
+                model_aspa, config_aspa, alpha_override = _instantiate_aspa_model(
                     seq_len,
                     seq_high,
                     d_model=D_MODEL,
@@ -1241,24 +1241,24 @@ def main(argv: list[str] | None = None) -> None:
                     allow_sdpa_fastpath=allow_sdpa_fastpath,
                     device=device,
                 )
-                mode_setting = getattr(config_dmoah, "attn_mode", "auto")
+                mode_setting = getattr(config_aspa, "attn_mode", "auto")
                 mode_display = mode_setting
                 shortlist_alpha = alpha_override
                 if shortlist_alpha is None:
                     seq_low_cfg = int(
-                        getattr(config_dmoah, "attn_active_seq_low", 256) or 256)
+                        getattr(config_aspa, "attn_active_seq_low", 256) or 256)
                     switch_ctx_cfg = int(
-                        getattr(config_dmoah, "attn_linear_switch_ctx", 8192) or 8192)
+                        getattr(config_aspa, "attn_linear_switch_ctx", 8192) or 8192)
                     shortlist_alpha = _shortlist_alpha_from_seq(
                         seq_len=seq_len, seq_low=seq_low_cfg, switch_ctx=switch_ctx_cfg)
 
-                model_dmoah.to(device)
-                model_dmoah.eval()
+                model_aspa.to(device)
+                model_aspa.eval()
 
                 try:
-                    latency = benchmark_forward_pass(model_dmoah, input_tensor)
+                    latency = benchmark_forward_pass(model_aspa, input_tensor)
                     throughput = (1000 / latency) * batch_eff
-                    mem_use = get_peak_memory_mb(model_dmoah, input_tensor)
+                    mem_use = get_peak_memory_mb(model_aspa, input_tensor)
                     status = "ok"
                 except RuntimeError as exc:
                     message = str(exc)
@@ -1269,12 +1269,12 @@ def main(argv: list[str] | None = None) -> None:
                         latency = None
                         throughput = None
                         mem_use = None
-                        if not dmoah_limit_announced[variant_key]:
+                        if not aspa_limit_announced[variant_key]:
                             prior = variant_last_success[variant_key]
                             info = prior if prior is not None else "<unknown>"
                             print(
                                 f"[Notice] {variant_label} hit its limit at seq_len={seq_len} (last safe ~{info}).")
-                            dmoah_limit_announced[variant_key] = True
+                            aspa_limit_announced[variant_key] = True
                     else:
                         raise
                 shortlist_alpha_val = shortlist_alpha
@@ -1285,9 +1285,9 @@ def main(argv: list[str] | None = None) -> None:
                     details = dict(details_raw) if isinstance(
                         details_raw, dict) else {}
                     last_stats = getattr(
-                        model_dmoah, 'last_head_stats', {}) or {}
+                        model_aspa, 'last_head_stats', {}) or {}
                     sparse_state = getattr(
-                        model_dmoah, '_last_sparse_state', {}) or {}
+                        model_aspa, '_last_sparse_state', {}) or {}
                     backend_override = sparse_state.get('backend')
                     if backend_override:
                         backend_name = str(backend_override)
@@ -1346,14 +1346,14 @@ def main(argv: list[str] | None = None) -> None:
                     alpha_value = shortlist_alpha_val
                     tokens_per_s = throughput * seq_len if throughput is not None else None
                 else:
-                    backend_display = "dmoah-limit"
+                    backend_display = "aspa-limit"
                     active_k_display = "-"
                     token_keep_display = "-"
                     token_keep = None
                     target_k = None
                     alpha_value = shortlist_alpha
                     tokens_per_s = None
-                del model_dmoah
+                del model_aspa
             else:
                 shortlist_backend = None
                 alpha_value = None
@@ -1416,13 +1416,13 @@ def main(argv: list[str] | None = None) -> None:
                 print(
                     f"[AutoLog] captured {variant_label} seq_len={seq_len} backend={backend_name}")
             else:
-                if device.type == 'cuda' and not dmoah_limit_announced[variant_key]:
+                if device.type == 'cuda' and not aspa_limit_announced[variant_key]:
                     print(
                         f"[Notice] {variant_label} skipping seq_len={seq_len} due to limit.")
-                    dmoah_limit_announced[variant_key] = True
+                    aspa_limit_announced[variant_key] = True
                 print(
                     f"{seq_len:<10} | {variant_label:<24} | {'OOM':<15} | {'-':<12} | {'-':<15} | {'-':<15} | "
-                    f"{'-':<10} | {'-':<10} | {'-':<7} | {'-':<16} | {'dmoah-limit':<36}"
+                    f"{'-':<10} | {'-':<10} | {'-':<7} | {'-':<16} | {'aspa-limit':<36}"
                 )
                 record.update({
                     "latency_ms": None,
@@ -1431,7 +1431,7 @@ def main(argv: list[str] | None = None) -> None:
                     "memory_mb": None,
                     "active_k": None,
                     "token_fraction": None,
-                    "backend": "dmoah-limit",
+                    "backend": "aspa-limit",
                     "mode": "-" if run_variant else None,
                     "status": "limit",
                     "shortlist_alpha": None,
@@ -1441,12 +1441,12 @@ def main(argv: list[str] | None = None) -> None:
             runs_summary.append(record)
 
         if chunked_shortlist_enabled:
-            has_dmoah_success = any(
+            has_aspa_success = any(
                 status == "ok" for status in variant_status_map.values()
             )
             should_run_chunked_shortlist = chunked_shortlist_active and (
                 seq_len >= args.shortlist_chunk_threshold
-                or not has_dmoah_success
+                or not has_aspa_success
             )
             if should_run_chunked_shortlist:
                 buffer_tokens = max(1, int(seq_len * args.shortlist_chunk_buffer_ratio))
@@ -1470,7 +1470,7 @@ def main(argv: list[str] | None = None) -> None:
                 )
                 record_shortlist = {
                     "seq_len": seq_len,
-                    "model": "dmoah_chunked_shortlist",
+                    "model": "aspa_chunked_shortlist",
                     "variant": f"Chunked Shortlist ({dtype_label})",
                     "quantized": False,
                     "batch_size": batch_eff,
@@ -1499,7 +1499,7 @@ def main(argv: list[str] | None = None) -> None:
                             print(f"[Notice] Chunked Shortlist hit its limit at seq_len={seq_len} (last safe ~{info}).")
                             chunked_shortlist_limit_announced = True
                         print(
-                            f"{seq_len:<10} | {'DMoAH + Chunked Shortlist':<24} | {'OOM':<15} | {'-':<12} | {'-':<15} | {'-':<15} | "
+                            f"{seq_len:<10} | {'ASPA + Chunked Shortlist':<24} | {'OOM':<15} | {'-':<12} | {'-':<15} | {'-':<15} | "
                             f"{'-':<10} | {'-':<10} | {'-':<7} | {'-':<16} | {'chunked_shortlist-limit':<36}"
                         )
                     else:
@@ -1545,7 +1545,7 @@ def main(argv: list[str] | None = None) -> None:
                     if len(backend_display_print) > 36:
                         backend_display_print = backend_display_print[:33] + "..."
                     print(
-                        f"{seq_len:<10} | {'DMoAH + Chunked Shortlist':<24} | {display_latency} | {display_throughput} | {display_tokens} | "
+                        f"{seq_len:<10} | {'ASPA + Chunked Shortlist':<24} | {display_latency} | {display_throughput} | {display_tokens} | "
                         f"{display_memory} | {active_k_display:<10} | {token_keep_display:<10} | {alpha_display:<7} | {mode_display:<16} | {backend_display_print:<36}"
                     )
                     record_shortlist.update({
@@ -1593,12 +1593,12 @@ def main(argv: list[str] | None = None) -> None:
 
     if device.type == 'cuda':
         std_msg = safe_std if safe_std is not None else "none"
-        dmoah_msg = safe_dmoah if safe_dmoah is not None else "none"
+        aspa_msg = safe_aspa if safe_aspa is not None else "none"
         shortlist_msg = safe_chunked_shortlist if safe_chunked_shortlist is not None else ("disabled" if not chunked_shortlist_enabled else "none")
         print(
-            f"\n[Summary] Standard safe length: {std_msg}; DMoAH safe length: {dmoah_msg}; Chunked Shortlist safe length: {shortlist_msg}.")
+            f"\n[Summary] Standard safe length: {std_msg}; ASPA safe length: {aspa_msg}; Chunked Shortlist safe length: {shortlist_msg}.")
     else:
-        std_msg = dmoah_msg = "cpu"
+        std_msg = aspa_msg = "cpu"
         shortlist_msg = "cpu" if chunked_shortlist_enabled else "disabled"
 
     std_last_safe = max((entry["seq_len"] for entry in runs_summary if entry.get(
@@ -1608,7 +1608,7 @@ def main(argv: list[str] | None = None) -> None:
             (
                 entry["seq_len"]
                 for entry in runs_summary
-                if entry.get("model") == f"dmoah_{key}" and entry.get("status") == "ok"
+                if entry.get("model") == f"aspa_{key}" and entry.get("status") == "ok"
             ),
             default=None,
         )
@@ -1618,7 +1618,7 @@ def main(argv: list[str] | None = None) -> None:
     safe_record = {
         "device": str(device),
         "safe_standard": std_msg,
-        "safe_dmoah": dmoah_msg,
+        "safe_aspa": aspa_msg,
         "safe_chunked_shortlist": shortlist_msg,
         "last_safe_standard": std_last_safe,
         "last_safe_variants": last_safe_variants,
@@ -1659,7 +1659,7 @@ def main(argv: list[str] | None = None) -> None:
         "standard": _estimate_alpha("standard"),
         **{
             model: _estimate_alpha(model)
-            for model in {entry["model"] for entry in runs_summary if entry["model"].startswith("dmoah_")}
+            for model in {entry["model"] for entry in runs_summary if entry["model"].startswith("aspa_")}
         },
     }
     summary_path: Path | None = None

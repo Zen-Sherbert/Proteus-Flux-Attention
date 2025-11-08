@@ -8,7 +8,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from proteus_attention.modules import CausalGeneticTransformerBlock
+from proteus_attention.modules import CausalASPATransformerBlock
 
 
 class DenseTransformerBlock(nn.Module):
@@ -99,7 +99,7 @@ class MiniProteusLM(nn.Module):
                 "attn_memory_decay": cfg.attn_memory_decay,
                 "attn_router_top_p": cfg.attn_router_top_p,
             }
-            block = CausalGeneticTransformerBlock(
+            block = CausalASPATransformerBlock(
                 embed_dim=cfg.embed_dim,
                 num_heads=cfg.num_heads,
                 dim_feedforward=cfg.dim_feedforward,
